@@ -9,8 +9,8 @@ namespace app {
 
   void runConstRef() {
     audit::Event e;
-    const audit::Event& cs = e;
-    recordConst(cs);
+    const audit::Event& constEventRef = e;
+    recordConst(constEventRef);
   }
 
   void runPrimitiveRef() {
