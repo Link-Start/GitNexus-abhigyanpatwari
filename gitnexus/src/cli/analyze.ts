@@ -67,13 +67,13 @@ const installFatalHandlers = (): void => {
   });
 };
 
-const HEAP_MB = 8192;
+const HEAP_MB = 16384;
 const HEAP_FLAG = `--max-old-space-size=${HEAP_MB}`;
 /** Increase default stack size (KB) to prevent stack overflow on deep class hierarchies. */
 const STACK_KB = 4096;
 const STACK_FLAG = `--stack-size=${STACK_KB}`;
 
-/** Re-exec the process with an 8GB heap and larger stack if we're currently below that. */
+/** Re-exec the process with a 16GB heap and larger stack if we're currently below that. */
 function ensureHeap(): boolean {
   const nodeOpts = process.env.NODE_OPTIONS || '';
   if (nodeOpts.includes('--max-old-space-size')) return false;
