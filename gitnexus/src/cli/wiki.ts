@@ -588,6 +588,8 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
 
     if (err.message?.includes('No source files')) {
       console.log(`\n  ${err.message}\n`);
+    } else if (err.message?.includes('LLM request timed out after')) {
+      console.log(`\n  Timeout: ${err.message}\n`);
     } else if (err.message?.includes('content filter')) {
       // Content filter block — actionable message
       console.log(`\n  Content Filter: ${err.message}\n`);

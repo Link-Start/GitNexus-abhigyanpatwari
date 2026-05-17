@@ -81,6 +81,13 @@ export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+function formatTimeoutDuration(timeoutMs: number): string {
+  if (timeoutMs >= 1000 && timeoutMs % 1000 === 0) {
+    return `${timeoutMs / 1000}s`;
+  }
+  return `${timeoutMs}ms`;
+}
+
 /**
  * Validate that a base URL supplied for LLM API calls is a safe HTTP/HTTPS
  * endpoint (CWE-918 / CodeQL js/http-to-file-access).
@@ -260,6 +267,16 @@ export async function callLLM(
       const errorText = await err.response.text().catch(() => 'unknown error');
       throw new Error(
         `LLM API error (${err.response.status} after retries): ${errorText.slice(0, 500)}`,
+      );
+    }
+    if (
+      config.requestTimeoutMs !== undefined &&
+      err instanceof DOMException &&
+      (err.name === 'TimeoutError' || err.name === 'AbortError')
+    ) {
+      throw new Error(
+        `LLM request timed out after ${formatTimeoutDuration(config.requestTimeoutMs)}. ` +
+          'Increase --timeout or omit it to disable the per-attempt timeout.',
       );
     }
     throw err;
