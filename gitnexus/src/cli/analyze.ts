@@ -69,7 +69,12 @@ const installFatalHandlers = (): void => {
 };
 
 const HEAP_MB = 16384;
-const HEAP_FLAG = `--max-old-space-size=${HEAP_MB}`;
+const TEST_RESPAWN_HEAP_MB = Number(process.env.GITNEXUS_TEST_RESPAWN_HEAP_MB);
+const RESPAWN_HEAP_MB =
+  Number.isFinite(TEST_RESPAWN_HEAP_MB) && TEST_RESPAWN_HEAP_MB > 0
+    ? Math.floor(TEST_RESPAWN_HEAP_MB)
+    : HEAP_MB;
+const HEAP_FLAG = `--max-old-space-size=${RESPAWN_HEAP_MB}`;
 /** Increase default stack size (KB) to prevent stack overflow on deep class hierarchies. */
 const STACK_KB = 4096;
 const STACK_FLAG = `--stack-size=${STACK_KB}`;
@@ -115,6 +120,12 @@ const childProcessLikelyOom = (err: unknown): boolean => {
   if (hasAnyChildOutput) return false;
 
   return e.status === 134 || e.signal === 'SIGABRT';
+};
+
+const maybeForceHeapOomForTest = (): void => {
+  if (process.env.GITNEXUS_TEST_FORCE_HEAP_OOM !== '1') return;
+  const chunks: string[] = [];
+  for (;;) chunks.push('x'.repeat(1024 * 1024));
 };
 
 /** Re-exec the process with a 16GB heap and larger stack if we're currently below that. */
@@ -238,6 +249,7 @@ export const shouldGenerateCommunitySkillFiles = (
 
 export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOptions) => {
   if (ensureHeap()) return;
+  maybeForceHeapOomForTest();
 
   // Install fatal handlers immediately after re-exec resolution so any
   // async error that escapes the try/catch below (#1169) surfaces with
