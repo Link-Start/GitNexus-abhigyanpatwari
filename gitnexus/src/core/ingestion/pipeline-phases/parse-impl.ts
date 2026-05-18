@@ -386,7 +386,7 @@ export async function runChunkedParseAndResolve(
         if (chunkHasWorkerUnsafeFiles && !hasWarnedAboutCppChunks) {
           hasWarnedAboutCppChunks = true;
           logger.warn(
-            `C/C++ files detected — parsing those chunks in sequential mode to avoid known ` +
+            `C/C++ files detected — parsing chunks containing C/C++ files in sequential mode to avoid known ` +
               `worker-thread native binding errors (e.g. \`Napi::Error\`). C/C++ source files ` +
               `are still fully indexed; chunks with no C/C++ continue using workers. ` +
               `Set GITNEXUS_ALLOW_CPP_WORKERS=1 if you use a custom tree-sitter build without this issue.`,

@@ -12,7 +12,7 @@ describe('hasWorkerUnsafeLanguages', () => {
     ).toBe(false);
   });
 
-  it('returns true when C++ files are present', () => {
+  it('returns true when C++ (.cpp) files are present', () => {
     expect(
       hasWorkerUnsafeLanguages([
         { path: 'src/main.ts', size: 123 },
