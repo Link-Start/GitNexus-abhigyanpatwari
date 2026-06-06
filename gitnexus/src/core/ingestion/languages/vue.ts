@@ -12,14 +12,31 @@
  */
 
 import { SupportedLanguages } from 'gitnexus-shared';
+import { createClassExtractor } from '../class-extractors/generic.js';
+import { vueClassConfig } from '../class-extractors/configs/typescript-javascript.js';
 import { defineLanguage } from '../language-provider.js';
 import { typeConfig as typescriptConfig } from '../type-extractors/typescript.js';
 import { tsExportChecker } from '../export-detection.js';
-import { resolveVueImport } from '../import-resolvers/vue.js';
-import { extractTsNamedBindings } from '../named-bindings/typescript.js';
+import { createImportResolver } from '../import-resolvers/resolver-factory.js';
+import { vueImportConfig } from '../import-resolvers/configs/typescript-javascript.js';
 import { TYPESCRIPT_QUERIES } from '../tree-sitter-queries.js';
 import { typescriptFieldExtractor } from '../field-extractors/typescript.js';
 import { BUILT_INS as TS_BUILT_INS } from './typescript.js';
+import { createVariableExtractor } from '../variable-extractors/generic.js';
+import { typescriptVariableConfig } from '../variable-extractors/configs/typescript-javascript.js';
+import { createCallExtractor } from '../call-extractors/generic.js';
+import { typescriptCallConfig } from '../call-extractors/configs/typescript-javascript.js';
+import {
+  interpretTsImport,
+  interpretTsTypeBinding,
+  tsBindingScopeFor,
+  tsImportOwningScope,
+  tsReceiverBinding,
+  typescriptMergeBindings,
+  typescriptArityCompatibility,
+  resolveTsImportTarget,
+} from './typescript/index.js';
+import { emitVueScopeCaptures } from './vue/captures.js';
 
 const VUE_SPECIFIC_BUILT_INS = [
   'ref',
@@ -55,14 +72,30 @@ const VUE_SPECIFIC_BUILT_INS = [
 
 const VUE_BUILT_INS: ReadonlySet<string> = new Set([...TS_BUILT_INS, ...VUE_SPECIFIC_BUILT_INS]);
 
+const vueClassExtractor = createClassExtractor(vueClassConfig);
+
 export const vueProvider = defineLanguage({
   id: SupportedLanguages.Vue,
   extensions: ['.vue'],
+  entryPointPatterns: [],
+  astFrameworkPatterns: [],
   treeSitterQueries: TYPESCRIPT_QUERIES,
   typeConfig: typescriptConfig,
   exportChecker: tsExportChecker,
-  importResolver: resolveVueImport,
-  namedBindingExtractor: extractTsNamedBindings,
+  importResolver: createImportResolver(vueImportConfig),
+  callExtractor: createCallExtractor(typescriptCallConfig),
   fieldExtractor: typescriptFieldExtractor,
+  variableExtractor: createVariableExtractor(typescriptVariableConfig),
+  classExtractor: vueClassExtractor,
   builtInNames: VUE_BUILT_INS,
+  // Scope-resolution pipeline hooks (RFC #909 Ring 3)
+  emitScopeCaptures: emitVueScopeCaptures,
+  interpretImport: interpretTsImport,
+  interpretTypeBinding: interpretTsTypeBinding,
+  bindingScopeFor: tsBindingScopeFor,
+  importOwningScope: tsImportOwningScope,
+  receiverBinding: tsReceiverBinding,
+  mergeBindings: (_scope, bindings) => typescriptMergeBindings(bindings),
+  arityCompatibility: typescriptArityCompatibility,
+  resolveImportTarget: resolveTsImportTarget,
 });

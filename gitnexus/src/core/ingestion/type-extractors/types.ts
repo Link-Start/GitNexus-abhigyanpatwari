@@ -32,7 +32,7 @@ export type ConstructorBindingScanner = (
 
 /** Infer the type name of a literal AST node for overload disambiguation.
  *  Returns the canonical type name (e.g. 'int', 'String', 'boolean') or undefined
- *  for non-literal nodes. Only used when resolveCallTarget has multiple candidates
+ *  for non-literal nodes. Only used when the call resolver has multiple candidates
  *  with parameterTypes — ~1-3% of call sites. */
 export type LiteralTypeInferrer = (node: SyntaxNode) => string | undefined;
 
@@ -54,7 +54,7 @@ export type DeclaredTypeUnwrapper = (
 ) => string | undefined;
 
 /** Narrow lookup interface for resolving a callee name → return type name.
- *  Backed by SymbolTable.lookupFuzzyCallable; passed via ForLoopExtractorContext.
+ *  Backed by SymbolTable.lookupCallableByName; passed via ForLoopExtractorContext.
  *  Conservative: returns undefined when the callee is ambiguous (0 or 2+ matches). */
 export interface ReturnTypeLookup {
   /** Processed type name after stripping wrappers (e.g., 'User' from 'Promise<User>').

@@ -1,6 +1,6 @@
 // gitnexus/src/core/ingestion/method-types.ts
 
-import type { SupportedLanguages } from 'gitnexus-shared';
+import type { ParameterTypeClass, SupportedLanguages } from 'gitnexus-shared';
 import type { FieldVisibility } from './field-types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
 
@@ -14,6 +14,7 @@ export interface ParameterInfo {
    *  Used by typeTagForId for overload disambiguation where generic args matter.
    *  Falls back to `type` when not set. */
   rawType?: string | null;
+  typeClass?: ParameterTypeClass;
   isOptional: boolean;
   isVariadic: boolean;
 }
@@ -60,6 +61,7 @@ export interface MethodExtractor {
    *  Return null to fall through to the generic extractor. */
   extractFunctionName?(
     node: SyntaxNode,
+    filePath?: string,
   ): { funcName: string | null; label: import('gitnexus-shared').NodeLabel } | null;
 }
 
@@ -82,6 +84,10 @@ export interface MethodExtractionConfig {
   isAsync?: (node: SyntaxNode) => boolean;
   isPartial?: (node: SyntaxNode) => boolean;
   isConst?: (node: SyntaxNode) => boolean;
+  /** Owner node types where member functions are effectively static (e.g.
+   *  Ruby singleton_class, Kotlin companion_object / object_declaration).
+   *  When the ownerNode matches one of these types, isStatic is forced true. */
+  staticOwnerTypes?: ReadonlySet<string>;
   /** Resolve the owner name from a standalone method node (e.g. Go receiver type). */
   extractOwnerName?: (node: SyntaxNode) => string | undefined;
   /** Extract a primary constructor from the owner node itself (e.g. C# 12 class Point(int x, int y)). */
@@ -93,5 +99,6 @@ export interface MethodExtractionConfig {
    *  Passed through to the MethodExtractor by createMethodExtractor. */
   extractFunctionName?: (
     node: SyntaxNode,
+    filePath?: string,
   ) => { funcName: string | null; label: import('gitnexus-shared').NodeLabel } | null;
 }

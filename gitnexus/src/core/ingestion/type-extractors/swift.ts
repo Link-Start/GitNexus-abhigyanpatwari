@@ -41,13 +41,17 @@ function unwrapSwiftExpression(node: SyntaxNode): SyntaxNode {
   return node;
 }
 
+function swiftNavigationSuffixName(node: SyntaxNode | null): string | undefined {
+  return node?.type === 'navigation_suffix' ? node.lastNamedChild?.text : node?.text;
+}
+
 /** Swift: let x: Foo = ... */
 const extractDeclaration: TypeBindingExtractor = (
   node: SyntaxNode,
   env: Map<string, string>,
 ): void => {
   // Swift property_declaration has pattern and type_annotation
-  const pattern = node.childForFieldName('pattern') ?? findChild(node, 'pattern');
+  const pattern = findChild(node, 'pattern');
   const typeAnnotation = node.childForFieldName('type') ?? findChild(node, 'type_annotation');
   if (!pattern || !typeAnnotation) return;
   const varName = extractVarName(pattern) ?? pattern.text;
@@ -61,10 +65,10 @@ const extractParameter: ParameterExtractor = (node: SyntaxNode, env: Map<string,
   let typeNode: SyntaxNode | null = null;
 
   if (node.type === 'parameter') {
-    nameNode = node.childForFieldName('name') ?? node.childForFieldName('internal_name');
+    nameNode = node.childForFieldName('name');
     typeNode = node.childForFieldName('type');
   } else {
-    nameNode = node.childForFieldName('name') ?? node.childForFieldName('pattern');
+    nameNode = node.childForFieldName('name');
     typeNode = node.childForFieldName('type');
   }
 
@@ -86,7 +90,7 @@ const extractInitializer: InitializerExtractor = (
   // Skip if has type annotation — extractDeclaration handled it
   if (node.childForFieldName('type') || findChild(node, 'type_annotation')) return;
   // Find pattern (variable name)
-  const pattern = node.childForFieldName('pattern') ?? findChild(node, 'pattern');
+  const pattern = findChild(node, 'pattern');
   if (!pattern) return;
   const varName = extractVarName(pattern) ?? pattern.text;
   if (!varName || env.has(varName)) return;
@@ -119,8 +123,10 @@ const extractInitializer: InitializerExtractor = (
   // Explicit init: User.init(name: "alice") — navigation_expression with .init suffix
   if (callee.type === 'navigation_expression') {
     const receiver = callee.firstNamedChild;
-    const suffix = callee.lastNamedChild;
-    if (receiver?.type === 'simple_identifier' && suffix?.text === 'init') {
+    if (
+      receiver?.type === 'simple_identifier' &&
+      swiftNavigationSuffixName(callee.lastNamedChild) === 'init'
+    ) {
       const calleeName = receiver.text;
       if (calleeName && classNames.has(calleeName)) {
         env.set(varName, calleeName);
@@ -133,7 +139,7 @@ const extractInitializer: InitializerExtractor = (
 const scanConstructorBinding: ConstructorBindingScanner = (node) => {
   if (node.type !== 'property_declaration') return undefined;
   if (hasTypeAnnotation(node)) return undefined;
-  const pattern = node.childForFieldName('pattern');
+  const pattern = findChild(node, 'pattern');
   if (!pattern) return undefined;
   const varName = pattern.text;
   if (!varName) return undefined;
@@ -162,7 +168,7 @@ const scanConstructorBinding: ConstructorBindingScanner = (node) => {
   if (callee.type === 'navigation_expression') {
     const receiver = callee.firstNamedChild;
     const suffix = callee.lastNamedChild;
-    if (receiver?.type === 'simple_identifier' && suffix?.text === 'init') {
+    if (receiver?.type === 'simple_identifier' && swiftNavigationSuffixName(suffix) === 'init') {
       return { varName, calleeName: receiver.text };
     }
     // General qualified call: service.getUser() → extract method name.

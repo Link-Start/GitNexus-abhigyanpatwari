@@ -8,7 +8,7 @@ import { cppConfig } from '../../src/core/ingestion/field-extractors/configs/c-c
 import { rubyConfig } from '../../src/core/ingestion/field-extractors/configs/ruby.js';
 import type { FieldExtractorContext } from '../../src/core/ingestion/field-types.js';
 import type { TypeEnvironment } from '../../src/core/ingestion/type-env.js';
-import { createSymbolTable } from '../../src/core/ingestion/symbol-table.js';
+import { createSemanticModel } from '../../src/core/ingestion/model/semantic-model.js';
 import Parser from 'tree-sitter';
 import TypeScript from 'tree-sitter-typescript';
 import Python from 'tree-sitter-python';
@@ -26,7 +26,13 @@ const parse = (code: string) => {
   return parser.parse(code);
 };
 
-// Mock context for tests
+// Mock context for tests. symbolTable comes from createSemanticModel().symbols
+// (the facade) rather than createSymbolTable() (the raw leaf) — this mirrors
+// production, where FieldExtractorContext always receives the SemanticModel-
+// wrapped facade so any .add() write dispatches through the owner-scoped
+// registries. No current field extractor calls symbolTable.add(), but
+// matching the production shape prevents silent drift if a future extractor
+// starts registering dynamically-discovered properties.
 const createMockContext = (): FieldExtractorContext => ({
   typeEnv: {
     lookup: () => undefined,
@@ -35,7 +41,7 @@ const createMockContext = (): FieldExtractorContext => ({
     allScopes: () => new Map(),
     constructorTypeMap: new Map(),
   } as TypeEnvironment,
-  symbolTable: createSymbolTable(),
+  symbolTable: createSemanticModel().symbols,
   filePath: 'test.ts',
   language: SupportedLanguages.TypeScript,
 });
@@ -695,6 +701,48 @@ describe('GenericFieldExtractor — Go', () => {
     const xNode = fieldList.namedChild(0)!;
     expect(goConfig.extractName(xNode)).toBe('X');
     expect(goConfig.extractType(xNode)).toBe('float64');
+  });
+
+  it('extracts every name from Go multi-name struct fields', () => {
+    const { typeDecl } = findTypeSpec(`type Point struct {\n\tX, y int\n}`);
+
+    const result = extractor.extract(typeDecl, mockContext);
+    expect(result).not.toBeNull();
+    expect(result!.fields).toHaveLength(2);
+
+    const xField = result!.fields.find((field) => field.name === 'X');
+    expect(xField).toBeDefined();
+    expect(xField!.type).toBe('int');
+    expect(xField!.visibility).toBe('public');
+
+    const yField = result!.fields.find((field) => field.name === 'y');
+    expect(yField).toBeDefined();
+    expect(yField!.type).toBe('int');
+    expect(yField!.visibility).toBe('package');
+  });
+
+  it('extracts Go multi-name struct fields when called with the runtime struct_type owner', () => {
+    const { typeDecl } = findTypeSpec(`type Point struct {\n\tX, y int\n}`);
+    const typeSpec = typeDecl.namedChild(0)!;
+    const structType = typeSpec.namedChild(1)!;
+
+    expect(structType.type).toBe('struct_type');
+    expect(extractor.isTypeDeclaration(structType)).toBe(true);
+
+    const result = extractor.extract(structType, mockContext);
+    expect(result).not.toBeNull();
+    expect(result!.ownerFqn).toBe('Point');
+    expect(result!.fields).toHaveLength(2);
+
+    const xField = result!.fields.find((field) => field.name === 'X');
+    expect(xField).toBeDefined();
+    expect(xField!.type).toBe('int');
+    expect(xField!.visibility).toBe('public');
+
+    const yField = result!.fields.find((field) => field.name === 'y');
+    expect(yField).toBeDefined();
+    expect(yField!.type).toBe('int');
+    expect(yField!.visibility).toBe('package');
   });
 
   it('reports isStatic and isReadonly as false for all fields', () => {

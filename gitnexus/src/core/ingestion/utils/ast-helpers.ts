@@ -1,10 +1,59 @@
 import type Parser from 'tree-sitter';
-import type { NodeLabel } from 'gitnexus-shared';
+import type { Capture, NodeLabel, Range } from 'gitnexus-shared';
 import type { LanguageProvider } from '../language-provider.js';
 import { generateId } from '../../../lib/utils.js';
+import {
+  extractTemplateArguments,
+  stripTemplateArguments,
+  templateArgumentsIdTag,
+} from './template-arguments.js';
+import { splitQualifiedName } from './qualified-name.js';
 
 /** Tree-sitter AST node. Re-exported for use across ingestion modules. */
 export type SyntaxNode = Parser.SyntaxNode;
+
+/**
+ * Qualify a Rust inherent-impl target (`impl Inner { ... }`) by its enclosing
+ * `mod_item` scope, so a bare same-tail target nested under different modules
+ * resolves to a DISTINCT path (`outer.Inner` vs `other.Inner`) — the #1982
+ * follow-up to #1975. Walks `mod_item` ancestors (outermost → innermost) and
+ * joins them with the normalized raw target via the shared `splitQualifiedName`.
+ * A top-level `impl Inner` (no enclosing mod) returns the bare target unchanged.
+ * Keyed purely on tree-sitter node types (no language name), matching the
+ * inherent-impl branch in `findEnclosingClassInfo`; the caller restricts this to
+ * UNSCOPED targets (`type_identifier`) so a SCOPED `impl a::Inner` keeps its full
+ * raw text (#1975). The Impl-node materialization in parsing-processor /
+ * parse-worker mirrors this so the owner edge and node id agree byte-for-byte.
+ */
+export const qualifyRustImplTargetByModScope = (
+  implNode: SyntaxNode,
+  rawTargetText: string,
+): string => {
+  const modSegments: string[] = [];
+  let current = implNode.parent;
+  while (current) {
+    if (current.type === 'mod_item') {
+      const nameNode =
+        current.childForFieldName?.('name') ??
+        current.children?.find((c: SyntaxNode) => c.type === 'identifier');
+      if (nameNode) modSegments.unshift(nameNode.text);
+    }
+    current = current.parent;
+  }
+  return [...modSegments, ...splitQualifiedName(rawTargetText)].filter(Boolean).join('.');
+};
+
+/**
+ * #1991: scope-label predicate that single-sources the `nodeLabel === 'Trait'`
+ * checks in parsing-processor.ts / parse-worker.ts. A Ruby `module` maps to the
+ * `Trait` registry label but is NOT a typeDeclaration, so `extractQualifiedName`
+ * bails on it; these node labels are instead qualified via the scope walk
+ * (`qualifyScopeName`) so same-tail nested modules get distinct ids. Keeping the
+ * literal in one place stops the four hand-maintained copies (two each in the
+ * sequential and worker definition paths) from drifting apart. Pure predicate —
+ * value-identical to the inlined `nodeLabel === 'Trait'`.
+ */
+export const isQualifiableScopeLabel = (nodeLabel: string): boolean => nodeLabel === 'Trait';
 
 /**
  * Ordered list of definition capture keys for tree-sitter query matches.
@@ -24,6 +73,7 @@ export const DEFINITION_CAPTURE_KEYS = [
   'definition.type',
   'definition.const',
   'definition.static',
+  'definition.variable',
   'definition.typedef',
   'definition.macro',
   'definition.union',
@@ -43,6 +93,51 @@ export const getDefinitionNodeFromCaptures = (
     if (captureMap[key]) return captureMap[key];
   }
   return null;
+};
+
+type QueryMatchLike = {
+  captures: Array<{ name: string; node: SyntaxNode }>;
+};
+
+const nodeRangeKey = (node: SyntaxNode): string =>
+  `${node.startPosition.row}:${node.startPosition.column}:${node.endPosition.row}:${node.endPosition.column}`;
+
+const isConcreteTypedefCapture = (captureMap: Record<string, SyntaxNode>): boolean => {
+  const definitionNode = getDefinitionNodeFromCaptures(captureMap);
+  return (
+    definitionNode?.type === 'type_definition' &&
+    (captureMap['definition.struct'] !== undefined || captureMap['definition.enum'] !== undefined)
+  );
+};
+
+export const buildConcreteTypedefDefinitionRanges = (
+  matches: readonly QueryMatchLike[],
+): Set<string> => {
+  const ranges = new Set<string>();
+  for (const match of matches) {
+    const captureMap: Record<string, SyntaxNode> = {};
+    for (const capture of match.captures) {
+      captureMap[capture.name] = capture.node;
+    }
+
+    const definitionNode = getDefinitionNodeFromCaptures(captureMap);
+    if (definitionNode && isConcreteTypedefCapture(captureMap)) {
+      ranges.add(nodeRangeKey(definitionNode));
+    }
+  }
+  return ranges;
+};
+
+export const isSuppressedConcreteTypedefDuplicate = (
+  captureMap: Record<string, SyntaxNode>,
+  concreteTypedefRanges: ReadonlySet<string>,
+): boolean => {
+  const definitionNode = getDefinitionNodeFromCaptures(captureMap);
+  return (
+    definitionNode?.type === 'type_definition' &&
+    captureMap['definition.typedef'] !== undefined &&
+    concreteTypedefRanges.has(nodeRangeKey(definitionNode))
+  );
 };
 
 /**
@@ -131,6 +226,9 @@ export const CLASS_CONTAINER_TYPES = new Set([
   // Kotlin
   'object_declaration',
   'companion_object',
+  // Go
+  'struct_type',
+  'interface_type',
 ]);
 
 export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
@@ -152,11 +250,57 @@ export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
   mixin_declaration: 'Mixin',
   extension_declaration: 'Extension',
   class: 'Class',
-  module: 'Module',
+  // Ruby `module` declarations map to `Trait` so they participate in the
+  // class-like type registry used by `lookupClassByName` / inheritance
+  // resolution. This lets `include` / `extend` / `prepend` mixin heritage
+  // resolve to the providing module. Safe for non-Ruby languages: the only supported
+  // grammar that uses the bare `module` AST node type as a container is
+  // Ruby (Rust uses `mod_item`). Any new language adding a `module` node
+  // type must explicitly reclassify here.
+  module: 'Trait',
   singleton_class: 'Class', // Ruby: class << self inherits enclosing class name
   object_declaration: 'Class',
   companion_object: 'Class',
+  struct_type: 'Struct',
+  interface_type: 'Interface',
 };
+
+/**
+ * Pre-order walk over a node and all its named descendants, invoking `cb` on
+ * each. Replaces the per-language `visit`/`visitGo`/`visitRust`/`visitSwift`
+ * clones that every language's capture-synthesis walker re-implemented (#1956
+ * tri-review U6).
+ *
+ * Iterates by index with a null guard: `node.namedChild(i)` is typed
+ * `SyntaxNode | null`, and most callers already guarded it. The Go and C#
+ * callers previously iterated `node.namedChildren`; the Go one had no null
+ * guard, so this standardizes them onto the guarded indexed form — a deliberate,
+ * strictly-safer behavior addition (the traversal *sequence* is identical, so
+ * capture output stays byte-identical on well-formed trees; the guard only
+ * matters for a null named child, which the fixture corpus never produces).
+ */
+export function walkNamedTree(node: SyntaxNode, cb: (node: SyntaxNode) => void): void {
+  cb(node);
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (child !== null) walkNamedTree(child, cb);
+  }
+}
+
+/** Return the first matching ancestor unless a boundary ancestor is reached first. */
+export function findAncestorBeforeBoundary(
+  node: SyntaxNode,
+  targetTypes: ReadonlySet<string>,
+  boundaryTypes: ReadonlySet<string>,
+): SyntaxNode | null {
+  let current = node.parent;
+  while (current !== null) {
+    if (boundaryTypes.has(current.type)) return null;
+    if (targetTypes.has(current.type)) return current;
+    current = current.parent;
+  }
+  return null;
+}
 
 /**
  * Determine the graph node label from a tree-sitter capture map.
@@ -169,7 +313,11 @@ export function getLabelFromCaptures(
   provider: LanguageProvider,
 ): NodeLabel | null {
   if (captureMap['import'] || captureMap['call']) return null;
-  if (!captureMap['name'] && !captureMap['definition.constructor']) return null;
+  const hasDefaultExportHocNameSeed =
+    captureMap['definition.function'] !== undefined &&
+    (captureMap['hoc'] !== undefined || captureMap['callee'] !== undefined);
+  if (!captureMap['name'] && !captureMap['definition.constructor'] && !hasDefaultExportHocNameSeed)
+    return null;
 
   if (captureMap['definition.function']) {
     if (provider.labelOverride) {
@@ -184,12 +332,23 @@ export function getLabelFromCaptures(
   if (captureMap['definition.struct']) return 'Struct';
   if (captureMap['definition.enum']) return 'Enum';
   if (captureMap['definition.namespace']) return 'Namespace';
-  if (captureMap['definition.module']) return 'Module';
+  if (captureMap['definition.module']) {
+    // Let providers reclassify module captures (e.g. Ruby remaps `Module`→`Trait`
+    // so mixin heritage resolves through `lookupClassByName`). Returning null
+    // from labelOverride means "skip this symbol"; treat it as a no-op here so
+    // we keep the default label rather than dropping a real definition.
+    if (provider.labelOverride) {
+      const override = provider.labelOverride(captureMap['definition.module'], 'Module');
+      if (override && override !== 'Module') return override;
+    }
+    return 'Module';
+  }
   if (captureMap['definition.trait']) return 'Trait';
   if (captureMap['definition.impl']) return 'Impl';
   if (captureMap['definition.type']) return 'TypeAlias';
   if (captureMap['definition.const']) return 'Const';
   if (captureMap['definition.static']) return 'Static';
+  if (captureMap['definition.variable']) return 'Variable';
   if (captureMap['definition.typedef']) return 'Typedef';
   if (captureMap['definition.macro']) return 'Macro';
   if (captureMap['definition.union']) return 'Union';
@@ -206,16 +365,61 @@ export function getLabelFromCaptures(
 export interface EnclosingClassInfo {
   classId: string; // e.g. "Class:animal.dart:Animal"
   className: string; // e.g. "Animal"
+  /**
+   * The owner node id keyed by the enclosing type's FULLY-QUALIFIED path
+   * (e.g. "Class:file:Outer.Inner"), present only when the language opts into
+   * `qualifiedNodeId` AND the enclosing type is actually nested (#1978).
+   * Consumers building HAS_METHOD/HAS_PROPERTY owner edges use this in
+   * preference to `classId` so the edge source matches the qualified class
+   * node id. When absent, `classId` (the simple-tail key) is unchanged.
+   */
+  qualifiedClassId?: string;
 }
 
 /** Walk up AST to find enclosing class/struct/interface/impl, return its ID and name.
- *  For Go method_declaration nodes, extracts receiver type (e.g. `func (u *User) Save()` → User struct). */
+ *  For Go method_declaration nodes, extracts receiver type (e.g. `func (u *User) Save()` → User struct).
+ *
+ *  @param resolveEnclosingOwner  Optional language-specific hook for container remapping.
+ *    When provided and a CLASS_CONTAINER_TYPES node is found, this hook is called:
+ *    - Return a different SyntaxNode to remap the container (e.g., Ruby singleton_class → class).
+ *    - Return `null` to skip this container and keep walking up.
+ *    - Return the input node (identity) to use the container as-is.
+ *    When omitted, the container node is used as-is.
+ *
+ *    INVARIANT: Implementers SHOULD return either `null`, the input node, or
+ *    another CLASS_CONTAINER_TYPES node. Returning a non-container node is
+ *    permitted but discouraged — it will cause the walk to skip the current
+ *    container and continue from the redirected node's parent. The
+ *    `MAX_ENCLOSING_WALK_ITERATIONS` defense-in-depth guard below prevents
+ *    pathological hooks from creating an infinite loop. */
+const MAX_ENCLOSING_WALK_ITERATIONS = 4096;
+
 export const findEnclosingClassInfo = (
   node: SyntaxNode,
   filePath: string,
+  resolveEnclosingOwner?: (node: SyntaxNode) => SyntaxNode | null,
+  /**
+   * Optional (#1978): returns the enclosing type's fully-qualified name
+   * (e.g. "Outer.Inner") for a type-declaration container, or null. Callers
+   * pass `classExtractor.extractQualifiedName` ONLY when the language's
+   * `qualifiedNodeId` flag is on — so when omitted, behavior is byte-identical
+   * to before (qualifiedClassId stays undefined). Used by the standard
+   * class-container branch to compute `qualifiedClassId` from the SAME function
+   * the node-id is built from, guaranteeing owner-id == node-id by construction.
+   */
+  getQualifiedOwnerName?: (node: SyntaxNode, simpleName: string) => string | null,
 ): EnclosingClassInfo | null => {
   let current = node.parent;
+  let iterations = 0;
+  // Tracks container nodes already visited via the hook so a misbehaving hook
+  // that keeps redirecting back to the same container cannot loop forever.
+  const visitedContainers = new Set<SyntaxNode>();
   while (current) {
+    if (++iterations > MAX_ENCLOSING_WALK_ITERATIONS) {
+      // Defense-in-depth: a real source tree has nowhere near this many ancestors.
+      // Bail out rather than hang ingestion.
+      return null;
+    }
     // Go: method_declaration has a receiver parameter with the struct type
     if (current.type === 'method_declaration') {
       const receiver = current.childForFieldName?.('receiver');
@@ -255,9 +459,32 @@ export const findEnclosingClassInfo = (
       }
     }
     if (CLASS_CONTAINER_TYPES.has(current.type)) {
+      // Delegate language-specific container remapping to the provider hook.
+      if (resolveEnclosingOwner) {
+        if (visitedContainers.has(current)) {
+          // We've already asked the hook about this container once — a loop
+          // would form (e.g., hook redirects to a child node whose parent is
+          // this same container). Skip and walk up.
+          current = current.parent;
+          continue;
+        }
+        visitedContainers.add(current);
+        const resolved = resolveEnclosingOwner(current);
+        if (resolved === null) {
+          // Provider says skip this container — keep walking up.
+          current = current.parent;
+          continue;
+        }
+        if (resolved !== current) {
+          // Provider remapped to a different node — re-evaluate from there.
+          current = resolved;
+          continue;
+        }
+      }
+
       // Rust impl_item: for `impl Trait for Struct {}`, pick the type after `for`
-      // NOTE: This impl_item ownership logic is duplicated in rust.ts:extractOwnerName.
-      // If modifying this block, update the other location too.
+      // NOTE: This impl_item ownership logic is mirrored in
+      // method-extractors/configs/rust.ts (extractOwnerName, metadata only).
       if (current.type === 'impl_item') {
         const children = current.children ?? [];
         const forIdx = children.findIndex((c: SyntaxNode) => c.text === 'for');
@@ -271,39 +498,68 @@ export const findEnclosingClassInfo = (
                 c.type === 'identifier',
             );
           if (nameNode) {
+            // `for` target keeps its raw text. A scoped path (impl T for a::Inner)
+            // therefore owns through `a::Inner`, which only resolves once the
+            // referenced struct is keyed by its qualified path — deferred to #1978.
             return {
               classId: generateId('Struct', `${filePath}:${nameNode.text}`),
               className: nameNode.text,
             };
           }
         }
-        const firstType = children.find((c: SyntaxNode) => c.type === 'type_identifier');
-        if (firstType) {
-          return {
-            classId: generateId('Impl', `${filePath}:${firstType.text}`),
-            className: firstType.text,
-          };
-        }
-      }
-
-      // Ruby singleton_class (class << self): walk up to the enclosing class/module
-      // to inherit its name. singleton_class has no name field — its receiver is
-      // `self` (node type 'self'), not 'identifier' or 'constant'.
-      if (current.type === 'singleton_class') {
-        let ancestor = current.parent;
-        while (ancestor) {
-          if (ancestor.type === 'class' || ancestor.type === 'module') {
-            const classNameNode = ancestor.childForFieldName?.('name');
-            if (classNameNode) {
-              return {
-                classId: generateId('Class', `${filePath}:${classNameNode.text}`),
-                className: classNameNode.text,
-              };
-            }
+        // Inherent impl target.
+        //   - SCOPED (`impl a::Inner`, scoped_type_identifier): key by FULL text,
+        //     matching the @definition.impl scoped arm (#1975). UNCHANGED.
+        //   - UNSCOPED (`impl Inner`, type_identifier): qualify by the enclosing
+        //     `mod_item` scope (`outer.Inner`) so two same-tail bare impls under
+        //     different mods own through DISTINCT nodes. The Impl-node
+        //     materialization (parsing-processor / parse-worker) mirrors this, so
+        //     the owner id == the Impl node id byte-for-byte (#1982).
+        //   - GENERIC (`impl<T> Inner<T>`, generic_type): the @definition.impl
+        //     node is materialized only when the generic base is a bare
+        //     `type_identifier` (tree-sitter-queries.ts), qualified the same way —
+        //     so drill into the base and mirror that gate, keeping the owner id ==
+        //     the node id byte-for-byte (#1992). A generic over a SCOPED base
+        //     (`impl<T> a::Inner<T>`) materializes NO node, so it must produce NO
+        //     owner (the method orphans — scoped-generic deferred, #1992).
+        const implTarget = children.find(
+          (c: SyntaxNode) =>
+            c.type === 'type_identifier' ||
+            c.type === 'scoped_type_identifier' ||
+            c.type === 'generic_type',
+        );
+        if (implTarget) {
+          const baseType =
+            implTarget.type === 'generic_type'
+              ? (implTarget.childForFieldName?.('type') ?? null)
+              : implTarget;
+          if (baseType?.type === 'type_identifier') {
+            // Bare target (`impl Inner` or `impl<T> Inner<T>`): qualify by mod scope.
+            // #1992 follow-up: qualify `className` too (not just `classId`). The
+            // method node id is keyed `${className}.${name}`, so a bare tail collapses
+            // two same-tail bare impls that ALSO share a method name (`a::Inner::m` +
+            // `b::Inner::m` both → `Inner.m`) onto one Method node (graph addNode is
+            // first-write-wins). Qualifying className → `a.Inner.m` / `b.Inner.m` keeps
+            // them distinct. Symmetric: the call-resolution fallback rebuilds the same
+            // `${className}.${name}` from the same enclosing-impl walk, so def and call
+            // ids still agree. Owner edge anchors on `classId` (already qualified).
+            const qualified = qualifyRustImplTargetByModScope(current, baseType.text);
+            return {
+              classId: generateId('Impl', `${filePath}:${qualified}`),
+              className: qualified,
+            };
           }
-          ancestor = ancestor.parent;
+          if (baseType?.type === 'scoped_type_identifier' && implTarget.type !== 'generic_type') {
+            // Top-level scoped `impl a::Inner`: key by full raw text (#1975).
+            return {
+              classId: generateId('Impl', `${filePath}:${baseType.text}`),
+              className: baseType.text,
+            };
+          }
+          // generic-over-scoped (`impl<T> a::Inner<T>`) and any other base: fall
+          // through with no owner — no @definition.impl node exists, so attributing
+          // a method to a synthesized id would orphan it against a phantom owner.
         }
-        // No enclosing class/module — skip singleton_class and keep walking up
       }
 
       const nameNode =
@@ -327,15 +583,157 @@ export const findEnclosingClassInfo = (
         ) {
           label = 'Interface';
         }
+        const templateArguments = extractTemplateArguments(nameNode.text);
+        const classIdName =
+          templateArguments !== undefined
+            ? `${stripTemplateArguments(nameNode.text)}${templateArgumentsIdTag(templateArguments)}`
+            : nameNode.text;
+        // #1978: when the language opts into qualified node ids, key the owner
+        // edge by the enclosing type's qualified path (e.g. "Outer.Inner") so it
+        // matches the qualified class node id. Derived from the SAME
+        // extractQualifiedName the node-id uses → agree by construction. Only set
+        // when actually nested (qualified !== simple); top-level types are
+        // unchanged. (Go receiver / Rust impl branches return earlier and are
+        // intentionally untouched here.)
+        const qualifiedOwnerName = getQualifiedOwnerName?.(current, nameNode.text);
+        const qualifiedClassId =
+          qualifiedOwnerName != null && qualifiedOwnerName !== nameNode.text
+            ? generateId(
+                label,
+                `${filePath}:${
+                  templateArguments !== undefined
+                    ? `${stripTemplateArguments(qualifiedOwnerName)}${templateArgumentsIdTag(templateArguments)}`
+                    : qualifiedOwnerName
+                }`,
+              )
+            : undefined;
         return {
-          classId: generateId(label, `${filePath}:${nameNode.text}`),
+          classId: generateId(label, `${filePath}:${classIdName}`),
           className: nameNode.text,
+          ...(qualifiedClassId !== undefined ? { qualifiedClassId } : {}),
         };
       }
     }
     current = current.parent;
   }
   return null;
+};
+
+/** Object literal binding info for TS/JS shorthand methods. */
+export interface ObjectLiteralBindingInfo {
+  ownerId: string;
+}
+
+/**
+ * Block-statement AST types that disqualify an object-literal binding from
+ * carrying a HAS_METHOD edge. A `const` declared inside one of these is block-
+ * scoped and cannot be imported, so attributing methods to it would create
+ * false-positive cross-file edges.
+ */
+const BLOCK_SCOPE_BOUNDARY_TYPES = new Set([
+  'statement_block',
+  'if_statement',
+  'else_clause',
+  'for_statement',
+  'for_in_statement',
+  'for_of_statement',
+  'while_statement',
+  'do_statement',
+  'try_statement',
+  'catch_clause',
+  'finally_clause',
+  'switch_statement',
+  'switch_case',
+  'switch_default',
+  'with_statement',
+]);
+
+/**
+ * Find the file-scope variable that owns an object literal method definition.
+ *
+ * Covers TypeScript/JavaScript shorthand object methods such as:
+ *
+ *   export const service = { async load() {} };
+ *
+ * tree-sitter represents `load` as a `method_definition` inside an `object`,
+ * not inside a class container. Without this fallback, ingestion emits a
+ * top-level `Method` node but no edge from the exported `service` value to
+ * that method, so impact queries cannot discover `service.load`.
+ *
+ * Two-phase walk:
+ *   Phase A walks up from `node` tracking how many `object` ancestors we
+ *     cross. The first `variable_declarator` reached with `objectDepth >= 1`
+ *     is the candidate owner — unless `objectDepth > 1` (the method belongs
+ *     to a nested object literal; we return null rather than misattribute
+ *     to the outer binding). Hitting a function/class container before the
+ *     declarator returns null (catches IIFE-wrapped literals).
+ *   Phase B walks the declarator's own ancestors. Any function or class
+ *     ancestor before reaching `program`/`export_statement` returns null
+ *     (catches `const` declared inside a function body). Any block-statement
+ *     ancestor also returns null (catches block-scoped declarations inside
+ *     top-level `if`/`for`/`try`/etc., which cannot be imported).
+ */
+export const findObjectLiteralBindingInfo = (
+  node: SyntaxNode,
+  filePath: string,
+): ObjectLiteralBindingInfo | null => {
+  // ── Phase A: walk up from node, count `object` ancestors, find declarator
+  let current: SyntaxNode | null = node;
+  let objectDepth = 0;
+  let declarator: SyntaxNode | null = null;
+
+  while (current) {
+    if (current.type === 'object') {
+      objectDepth += 1;
+    }
+
+    if (current.type === 'variable_declarator' && objectDepth >= 1) {
+      if (objectDepth > 1) {
+        // Method belongs to a nested object literal; safe under-approximation.
+        return null;
+      }
+      declarator = current;
+      break;
+    }
+
+    if (
+      current !== node &&
+      (FUNCTION_NODE_TYPES.has(current.type) || CLASS_CONTAINER_TYPES.has(current.type))
+    ) {
+      // Function/class container encountered before owning declarator
+      // (e.g. IIFE-wrapped object literal). Bail out.
+      return null;
+    }
+
+    current = current.parent;
+  }
+
+  if (!declarator) return null;
+
+  // ── Phase B: declarator must live at file scope (program / export_statement)
+  // with no function, class, or block-statement ancestor in between.
+  let anc: SyntaxNode | null = declarator.parent;
+  while (anc) {
+    if (anc.type === 'program' || anc.type === 'export_statement') {
+      break;
+    }
+    if (FUNCTION_NODE_TYPES.has(anc.type) || CLASS_CONTAINER_TYPES.has(anc.type)) {
+      return null;
+    }
+    if (BLOCK_SCOPE_BOUNDARY_TYPES.has(anc.type)) {
+      return null;
+    }
+    anc = anc.parent;
+  }
+
+  const nameNode = declarator.childForFieldName?.('name');
+  if (!nameNode || nameNode.type !== 'identifier') return null;
+
+  const declaration = declarator.parent;
+  const ownerLabel = declaration?.type === 'variable_declaration' ? 'Variable' : 'Const';
+  return {
+    ownerId: generateId(ownerLabel, `${filePath}:${nameNode.text}`),
+  };
 };
 
 /** Convenience wrapper: returns just the class ID string (backward compat). */
@@ -366,10 +764,24 @@ export const findSiblingChild = (
 
 /** Generic name extraction from a function-like AST node.
  *  Tries `node.childForFieldName('name')?.text`, then scans children for
- *  `identifier` / `property_identifier` / `simple_identifier`. */
+ *  `identifier` / `property_identifier` / `simple_identifier`.
+ *
+ *  `arrow_function` and `function_expression` (TS/JS) are inherently
+ *  anonymous — they have no `name` field, and their first identifier
+ *  child is a *parameter*, not a function name. Returning a parameter
+ *  identifier here would synthesize phantom Function IDs (e.g. callers
+ *  walking up from a call inside `arr.map(x => fn(x))` would get
+ *  attributed to a non-existent "Function x"). The language's
+ *  `methodExtractor.extractFunctionName` hook is responsible for naming
+ *  these via parent context (variable_declarator, pair, etc.); when it
+ *  declines, the parent walk should continue rather than fall through
+ *  here. See issue #1166. */
 export const genericFuncName = (node: SyntaxNode): string | null => {
   const nameField = node.childForFieldName?.('name');
   if (nameField) return nameField.text;
+  if (node.type === 'arrow_function' || node.type === 'function_expression') {
+    return null;
+  }
   for (let i = 0; i < node.childCount; i++) {
     const c = node.child(i);
     if (
@@ -412,11 +824,16 @@ export const CALL_ARGUMENT_LIST_TYPES = new Set(['arguments', 'argument_list', '
 // ============================================================================
 
 /** Walk an AST node depth-first, returning the first descendant with the given type. */
-export function findDescendant(node: SyntaxNode, type: string): SyntaxNode | null {
-  if (node.type === type) return node;
-  for (const child of node.children ?? []) {
-    const found = findDescendant(child, type);
-    if (found) return found;
+export function findDescendant(root: SyntaxNode, type: string): SyntaxNode | null {
+  const stack: SyntaxNode[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (node.type === type) return node;
+    // Push in reverse order so left children are visited first (depth-first)
+    const children = node.children ?? [];
+    for (let i = children.length - 1; i >= 0; i--) {
+      stack.push(children[i]);
+    }
   }
   return null;
 }
@@ -437,4 +854,102 @@ export function findChild(node: SyntaxNode, type: string): SyntaxNode | null {
     if (child?.type === type) return child;
   }
   return null;
+}
+
+// ============================================================================
+// Capture + range helpers (formerly python/ast-utils.ts — language-agnostic)
+// ============================================================================
+
+/** Convert a tree-sitter node to a `Capture` with 1-based line numbers
+ *  (matching RFC §2.1). The tag includes the leading `@`. */
+export function nodeToCapture(name: string, node: SyntaxNode): Capture {
+  return {
+    name,
+    range: {
+      startLine: node.startPosition.row + 1,
+      startCol: node.startPosition.column,
+      endLine: node.endPosition.row + 1,
+      endCol: node.endPosition.column,
+    },
+    text: node.text,
+  };
+}
+
+/** Build a `Capture` whose range mirrors `atNode` but whose `text` is
+ *  caller-supplied. Used to synthesize markers that don't have a
+ *  corresponding source token. */
+export function syntheticCapture(name: string, atNode: SyntaxNode, text: string): Capture {
+  return {
+    name,
+    range: {
+      startLine: atNode.startPosition.row + 1,
+      startCol: atNode.startPosition.column,
+      endLine: atNode.endPosition.row + 1,
+      endCol: atNode.endPosition.column,
+    },
+    text,
+  };
+}
+
+function rangeMatches(node: SyntaxNode, range: Range): boolean {
+  return (
+    node.startPosition.row + 1 === range.startLine &&
+    node.startPosition.column === range.startCol &&
+    node.endPosition.row + 1 === range.endLine &&
+    node.endPosition.column === range.endCol
+  );
+}
+
+/** Walk a subtree to find a node whose range exactly matches AND whose
+ *  type matches `expectedType` (when given). When multiple nodes share
+ *  the range — e.g., `function_definition` and its inner `block` body
+ *  for a one-liner — the type filter disambiguates.
+ *
+ *  Iterative depth-first-left-to-right via an explicit stack. Children
+ *  are pushed in reverse index order so LIFO pop visits them in source
+ *  order. Prunes branches that can't contain the target range by
+ *  row bounds — same optimization the prior recursive form used, minus
+ *  the early-break since stack-push is cheap. */
+export function findNodeAtRange(
+  root: SyntaxNode,
+  range: Range,
+  expectedType?: string,
+): SyntaxNode | null {
+  const startRow = range.startLine - 1;
+  const endRow = range.endLine - 1;
+  const stack: SyntaxNode[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (rangeMatches(node, range) && (expectedType === undefined || node.type === expectedType)) {
+      return node;
+    }
+    for (let i = node.namedChildCount - 1; i >= 0; i--) {
+      const child = node.namedChild(i);
+      if (child === null) continue;
+      if (child.endPosition.row < startRow) continue;
+      if (child.startPosition.row > endRow) continue;
+      stack.push(child);
+    }
+  }
+  return null;
+}
+
+/**
+ * Return the captured node if its type is one of `types`, else null.
+ *
+ * The threaded-node equivalent of `findNodeAtRange(root, capture.range, type)`
+ * for the common case where a tree-sitter query already hands you the matched
+ * node (`c.node`): the captured node IS the node at that range, so a type check
+ * is exact and there is no need to re-walk from the tree root (the
+ * O(matches × rootChildren) hot path #1848 hit). Unlike `findNodeAtRange`, this
+ * does NOT traverse — the caller must already hold the node; for a multi-type
+ * call the node must literally be one of `types` (no fallback search).
+ *
+ * Used by every language's scope-capture path (go/python/ruby/php/rust/csharp).
+ */
+export function nodeIfType<T extends SyntaxNode>(
+  node: T | undefined,
+  ...types: readonly string[]
+): T | null {
+  return node !== undefined && types.includes(node.type) ? node : null;
 }

@@ -8,10 +8,12 @@ import type {
   TsconfigPaths,
   GoModuleConfig,
   CSharpProjectConfig,
+  CSharpNamespaceEvidence,
   ComposerConfig,
 } from '../language-config.js';
 import type { SwiftPackageConfig } from '../language-config.js';
 import type { SuffixIndex } from './utils.js';
+import type { SupportedLanguages } from 'gitnexus-shared';
 
 /**
  * Result of resolving an import via language-specific dispatch.
@@ -31,6 +33,8 @@ export interface ImportConfigs {
   composerConfig: ComposerConfig | null;
   swiftPackageConfig: SwiftPackageConfig | null;
   csharpConfigs: CSharpProjectConfig[];
+  /** In-repo namespace evidence gating C# suffix-fallback resolution (#1881). */
+  csharpNamespaces?: CSharpNamespaceEvidence;
 }
 
 /** Pre-built lookup structures for import resolution. Build once, reuse across chunks. */
@@ -53,3 +57,28 @@ export type ImportResolverFn = (
   filePath: string,
   resolveCtx: ResolveCtx,
 ) => ImportResult;
+
+/**
+ * A single import resolution strategy — one step in a composable chain.
+ * Same signature as ImportResolverFn. Returns null to let the next strategy
+ * in the chain try; returns a result (even with empty files) to stop the chain.
+ */
+export type ImportResolverStrategy = ImportResolverFn;
+
+/**
+ * Declarative config for composable import resolution — mirrors the
+ * MethodExtractionConfig / CallExtractionConfig pattern.
+ *
+ * Each language declares an ordered list of strategies to try.
+ * The factory (`createImportResolver`) chains them: first non-null result wins.
+ */
+export interface ImportResolutionConfig {
+  /**
+   * Documentation-only metadata identifying which language this config serves.
+   * **Not used by `createImportResolver`** — the factory only iterates `strategies`.
+   * Useful for logging, debugging, and compile-time exhaustiveness checks when
+   * mapping `SupportedLanguages → ImportResolutionConfig` in language providers.
+   */
+  readonly language: SupportedLanguages;
+  readonly strategies: readonly ImportResolverStrategy[];
+}

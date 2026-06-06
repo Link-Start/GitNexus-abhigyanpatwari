@@ -176,6 +176,16 @@ export const javaMethodConfig: MethodExtractionConfig = {
 
 const KOTLIN_VIS = new Set<MethodVisibility>(['public', 'private', 'protected', 'internal']);
 
+function kotlinParameterHasDefaultValue(param: SyntaxNode): boolean {
+  // tree-sitter-kotlin inlines `_function_value_parameter`, so `=` and its
+  // expression are siblings of `parameter`, not children of the parameter.
+  for (let sibling = param.nextSibling; sibling !== null; sibling = sibling.nextSibling) {
+    if (sibling.type === ',' || sibling.type === ')') return false;
+    if (sibling.type === '=') return true;
+  }
+  return false;
+}
+
 function extractKotlinParameters(node: SyntaxNode): ParameterInfo[] {
   const params: ParameterInfo[] = [];
   // Kotlin: function_declaration > function_value_parameters > parameter
@@ -199,7 +209,6 @@ function extractKotlinParameters(node: SyntaxNode): ParameterInfo[] {
         let paramName: string | undefined;
         let paramType: string | null = null;
         let paramRawType: string | null = null;
-        let hasDefault = false;
         const isVariadic = nextIsVariadic;
         nextIsVariadic = false;
 
@@ -218,21 +227,12 @@ function extractKotlinParameters(node: SyntaxNode): ParameterInfo[] {
           }
         }
 
-        // Check for default value: `= expr`
-        for (let k = 0; k < param.childCount; k++) {
-          const c = param.child(k);
-          if (c && c.text === '=') {
-            hasDefault = true;
-            break;
-          }
-        }
-
         if (paramName) {
           params.push({
             name: paramName,
             type: paramType,
             rawType: paramRawType,
-            isOptional: hasDefault,
+            isOptional: kotlinParameterHasDefaultValue(param),
             isVariadic: isVariadic,
           });
         }
@@ -273,6 +273,7 @@ export const kotlinMethodConfig: MethodExtractionConfig = {
   typeDeclarationNodes: ['class_declaration', 'object_declaration', 'companion_object'],
   methodNodeTypes: ['function_declaration'],
   bodyNodeTypes: ['class_body'],
+  staticOwnerTypes: new Set(['companion_object', 'object_declaration']),
   extractName(node) {
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);

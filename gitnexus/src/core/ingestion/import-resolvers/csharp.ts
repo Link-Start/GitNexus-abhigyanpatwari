@@ -1,18 +1,22 @@
 /**
- * C# namespace import resolution.
- * Handles using-directive resolution via .csproj root namespace stripping.
+ * C# namespace import resolution — internal helpers.
+ *
+ * Strategy lives in configs/csharp.ts.
+ * This file contains shared helpers for namespace-based resolution.
  */
 
 import type { SuffixIndex } from './utils.js';
 import { suffixResolve } from './utils.js';
-import { SupportedLanguages } from 'gitnexus-shared';
-import type { ImportResult, ResolveCtx } from './types.js';
-import { resolveStandard } from './standard.js';
-import type { CSharpProjectConfig } from '../language-config.js';
+import type { CSharpProjectConfig, CSharpNamespaceEvidence } from '../language-config.js';
+import { csharpSuffixFallbackAllowed } from '../csharp-namespace-gate.js';
 
 /**
  * Resolve a C# using-directive import path to matching .cs files (low-level helper).
  * Tries single-file match first, then directory match for namespace imports.
+ *
+ * The final unanchored suffix fallback is gated on `evidence` so BCL usings
+ * (e.g. `System.Threading.Tasks`) can't match a coincidentally-named local
+ * file (#1881). When `evidence` is omitted the fallback stays permissive.
  */
 export function resolveCSharpImportInternal(
   importPath: string,
@@ -20,6 +24,7 @@ export function resolveCSharpImportInternal(
   normalizedFileList: string[],
   allFileList: string[],
   index?: SuffixIndex,
+  evidence?: CSharpNamespaceEvidence,
 ): string[] {
   const namespacePath = importPath.replace(/\./g, '/');
   const results: string[] = [];
@@ -87,7 +92,11 @@ export function resolveCSharpImportInternal(
     }
   }
 
-  // Fallback: suffix matching without namespace stripping (single file)
+  // Fallback: suffix matching without namespace stripping (single file).
+  // Gated on in-repo declared-namespace evidence (#1881).
+  if (!csharpSuffixFallbackAllowed(importPath, evidence)) {
+    return [];
+  }
   const pathParts = namespacePath.split('/').filter(Boolean);
   const fallback = suffixResolve(pathParts, normalizedFileList, allFileList, index);
   return fallback ? [fallback] : [];
@@ -125,30 +134,4 @@ export function resolveCSharpNamespaceDir(
   }
 
   return null;
-}
-
-/** C#: namespace-based resolution via .csproj configs, with suffix-match fallback. */
-export function resolveCSharpImport(
-  rawImportPath: string,
-  filePath: string,
-  ctx: ResolveCtx,
-): ImportResult {
-  const csharpConfigs = ctx.configs.csharpConfigs;
-  if (csharpConfigs.length > 0) {
-    const resolvedFiles = resolveCSharpImportInternal(
-      rawImportPath,
-      csharpConfigs,
-      ctx.normalizedFileList,
-      ctx.allFileList,
-      ctx.index,
-    );
-    if (resolvedFiles.length > 1) {
-      const dirSuffix = resolveCSharpNamespaceDir(rawImportPath, csharpConfigs);
-      if (dirSuffix) {
-        return { kind: 'package', files: resolvedFiles, dirSuffix };
-      }
-    }
-    if (resolvedFiles.length > 0) return { kind: 'files', files: resolvedFiles };
-  }
-  return resolveStandard(rawImportPath, filePath, ctx, SupportedLanguages.CSharp);
 }

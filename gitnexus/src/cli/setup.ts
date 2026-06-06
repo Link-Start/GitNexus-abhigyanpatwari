@@ -10,14 +10,67 @@ import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import { execFile, execFileSync } from 'child_process';
+import { createRequire } from 'module';
 import { promisify } from 'util';
 import { fileURLToPath } from 'url';
-import { glob } from 'glob';
+import { parseTree, modify, applyEdits, ParseError, parse as parseJsonc } from 'jsonc-parser';
 import { getGlobalDir } from '../storage/repo-manager.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const execFileAsync = promisify(execFile);
+
+// Pin the npx fallback to the installed version. Reason: setup.ts writes
+// a config that persists in the user's editor and is invoked on every MCP
+// connect. Pinning to the installed version means subsequent invocations
+// skip the npm-registry metadata roundtrip (and stay reproducible until
+// the user upgrades). Static configs and READMEs intentionally use
+// `gitnexus@latest` since they're quickstart docs, not persisted state.
+const _require = createRequire(import.meta.url);
+const _pkg = _require('../../package.json') as { version?: unknown };
+if (typeof _pkg.version !== 'string' || !_pkg.version) {
+  throw new Error(
+    'gitnexus/package.json#version is missing or not a string — cannot generate MCP fallback config.',
+  );
+}
+// Version-pinned ref for the persisted MCP entry — deliberately distinct from
+// the cjs's exported `gitnexus@latest` hint ref (resolve-analyze-cmd.cjs); the
+// two are not unified (see the comment above and that file's MCP_PINNED_REF).
+const MCP_PINNED_REF = `gitnexus@${_pkg.version}`;
+
+/**
+ * Build the `command` string written into an editor's hook settings, which the
+ * editor shell-evaluates. `hookPath` is already forward-slash-normalized.
+ *
+ * On POSIX, single-quote the path: a single-quoted shell string expands nothing,
+ * so spaces and metacharacters ($, backtick, ;, |, &, newline, parens) in the
+ * install path cannot run as commands. The only character needing escaping
+ * inside single quotes is the single quote, via the standard `'\''` idiom
+ * (close, literal-quote, reopen). The previous double-quoted `node "..."` form
+ * left $/backtick live — a code-execution risk for an adversarial $HOME.
+ *
+ * On Windows, filenames cannot contain these POSIX metacharacters and the path
+ * is forward-slashed, so keep the double-quoted form with backslash-then-quote
+ * escaping (CodeQL js/incomplete-sanitization safe ordering).
+ */
+export function formatHookCommand(
+  hookPath: string,
+  isWindows = process.platform === 'win32',
+): string {
+  if (isWindows) {
+    const escaped = hookPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    return `node "${escaped}"`;
+  }
+  return `node '${hookPath.replace(/'/g, "'\\''")}'`;
+}
+
+// The exact source line each hook adapter ships, rewritten at install time to
+// point cliPath at the installed CLI. Kept as a named constant so the install
+// patch and its drift guard reference one string — if the adapter source ever
+// changes this literal, the guard records an actionable error instead of
+// silently shipping a hook with an unresolved relative cliPath.
+const CLI_PATH_SOURCE_LITERAL =
+  "let cliPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');";
 
 interface SetupResult {
   configured: string[];
@@ -31,15 +84,30 @@ interface SetupResult {
  */
 function resolveGitnexusBin(): string | null {
   try {
-    const cmd = process.platform === 'win32' ? 'where' : 'which';
-    const resolved = execFileSync(cmd, ['gitnexus'], {
+    const isWin = process.platform === 'win32';
+    const cmd = isWin ? 'where' : 'which';
+    const output = execFileSync(cmd, ['gitnexus'], {
       encoding: 'utf-8',
       timeout: 5000,
       stdio: ['ignore', 'pipe', 'ignore'],
-    })
-      .split('\n')[0]
-      .trim();
-    return resolved || null;
+      windowsHide: true,
+    });
+    const lines = output
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    if (isWin) {
+      // On Windows, npm global installs can surface multiple launchers for the
+      // same package (e.g. a POSIX shell shim plus .cmd/.bat wrappers). Claude
+      // and the other MCP hosts need a directly spawnable command path, so only
+      // accept the Windows wrapper. If it is missing, fall back to the slower
+      // npx entry instead of persisting a non-spawnable shim path.
+      const cmdLine = lines.find((l) => /\.(cmd|bat)$/i.test(l));
+      return cmdLine || null;
+    }
+
+    return lines[0] || null;
   } catch {
     return null;
   }
@@ -49,8 +117,10 @@ function resolveGitnexusBin(): string | null {
  * The MCP server entry for all editors.
  *
  * Prefers the globally-installed `gitnexus` binary (starts in ~1 s) over
- * `npx -y gitnexus@latest` (cold-cache install of native deps can take
- * >60 s, exceeding Claude Code's 30 s MCP connection timeout).
+ * `npx -y gitnexus@<version>` (cold-cache install of native deps can take
+ * >60 s, exceeding Claude Code's 30 s MCP connection timeout). The fallback
+ * version is read from gitnexus/package.json#version at module load so the
+ * persisted user config matches the installed package.
  *
  * Falls back to npx when the binary isn't on PATH — e.g. first-time
  * users who ran `npx gitnexus analyze` but haven't done `npm i -g`.
@@ -66,48 +136,80 @@ function getMcpEntry() {
   if (process.platform === 'win32') {
     return {
       command: 'cmd',
-      args: ['/c', 'npx', '-y', 'gitnexus@latest', 'mcp'],
+      args: ['/c', 'npx', '-y', MCP_PINNED_REF, 'mcp'],
     };
   }
   return {
     command: 'npx',
-    args: ['-y', 'gitnexus@latest', 'mcp'],
+    args: ['-y', MCP_PINNED_REF, 'mcp'],
   };
 }
 
 /**
- * Merge gitnexus entry into an existing MCP config JSON object.
- * Returns the updated config.
+ * OpenCode uses a different MCP format: { type: "local", command: [...] }
+ * where command is a flat array (command + args combined).
  */
-function mergeMcpConfig(existing: any): any {
-  if (!existing || typeof existing !== 'object') {
-    existing = {};
+function getOpenCodeMcpEntry() {
+  const bin = resolveGitnexusBin();
+
+  if (bin) {
+    return { type: 'local', command: [bin, 'mcp'] };
   }
-  if (!existing.mcpServers || typeof existing.mcpServers !== 'object') {
-    existing.mcpServers = {};
+
+  if (process.platform === 'win32') {
+    return { type: 'local', command: ['cmd', '/c', 'npx', '-y', MCP_PINNED_REF, 'mcp'] };
   }
-  existing.mcpServers.gitnexus = getMcpEntry();
-  return existing;
+  return { type: 'local', command: ['npx', '-y', MCP_PINNED_REF, 'mcp'] };
 }
 
 /**
- * Try to read a JSON file, returning null if it doesn't exist or is invalid.
+ * Detect indentation style from file content.
+ * Returns formatting options matching the file's existing style.
  */
-async function readJsonFile(filePath: string): Promise<any | null> {
+function detectIndentation(raw: string): { tabSize: number; insertSpaces: boolean } {
+  const firstIndented = raw.match(/^( +|\t)/m);
+  if (!firstIndented) return { tabSize: 2, insertSpaces: true };
+  if (firstIndented[1] === '\t') return { tabSize: 1, insertSpaces: false };
+  return { tabSize: firstIndented[1].length, insertSpaces: true };
+}
+
+/**
+ * Merge a key/value pair into a JSONC config file, preserving comments and formatting.
+ * If the file is genuinely corrupt (not valid JSONC), leaves it untouched.
+ */
+async function mergeJsoncFile(
+  filePath: string,
+  keyPath: string[],
+  value: unknown,
+): Promise<boolean> {
+  let raw: string;
   try {
-    const raw = await fs.readFile(filePath, 'utf-8');
-    return JSON.parse(raw);
+    raw = await fs.readFile(filePath, 'utf-8');
   } catch {
-    return null;
+    raw = '';
   }
-}
 
-/**
- * Write JSON to a file, creating parent directories if needed.
- */
-async function writeJsonFile(filePath: string, data: any): Promise<void> {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+  if (raw.trim().length === 0) {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    const formattingOptions = { tabSize: 2, insertSpaces: true };
+    const edits = modify('{}', keyPath, value, { formattingOptions });
+    const result = applyEdits('{}', edits);
+    await fs.writeFile(filePath, result, 'utf-8');
+    return true;
+  }
+
+  const parseErrors: ParseError[] = [];
+  const tree = parseTree(raw, parseErrors);
+
+  if (tree && tree.type === 'object' && parseErrors.length === 0) {
+    const formattingOptions = detectIndentation(raw);
+    const edits = modify(raw, keyPath, value, { formattingOptions });
+    const result = applyEdits(raw, edits);
+    await fs.writeFile(filePath, result, 'utf-8');
+    return true;
+  }
+
+  return false;
 }
 
 /**
@@ -133,10 +235,12 @@ async function setupCursor(result: SetupResult): Promise<void> {
 
   const mcpPath = path.join(cursorDir, 'mcp.json');
   try {
-    const existing = await readJsonFile(mcpPath);
-    const updated = mergeMcpConfig(existing);
-    await writeJsonFile(mcpPath, updated);
-    result.configured.push('Cursor');
+    const ok = await mergeJsoncFile(mcpPath, ['mcpServers', 'gitnexus'], getMcpEntry());
+    if (ok) {
+      result.configured.push('Cursor');
+    } else {
+      result.errors.push('Cursor: mcp.json is corrupt — skipping to preserve existing content');
+    }
   } catch (err: any) {
     result.errors.push(`Cursor: ${err.message}`);
   }
@@ -152,10 +256,14 @@ async function setupClaudeCode(result: SetupResult): Promise<void> {
   // Claude Code stores MCP config in ~/.claude.json
   const mcpPath = path.join(os.homedir(), '.claude.json');
   try {
-    const existing = await readJsonFile(mcpPath);
-    const updated = mergeMcpConfig(existing);
-    await writeJsonFile(mcpPath, updated);
-    result.configured.push('Claude Code');
+    const ok = await mergeJsoncFile(mcpPath, ['mcpServers', 'gitnexus'], getMcpEntry());
+    if (ok) {
+      result.configured.push('Claude Code');
+    } else {
+      result.errors.push(
+        'Claude Code: .claude.json is corrupt — skipping to preserve existing content',
+      );
+    }
   } catch (err: any) {
     result.errors.push(`Claude Code: ${err.message}`);
   }
@@ -180,8 +288,135 @@ async function installClaudeCodeSkills(result: SetupResult): Promise<void> {
 }
 
 /**
+ * Check whether an event array already contains a gitnexus-hook entry.
+ */
+function hasGitnexusHook(
+  hooksObj: any,
+  eventName: string,
+  commandFragment = 'gitnexus-hook',
+): boolean {
+  const entries = hooksObj?.[eventName];
+  if (!Array.isArray(entries)) return false;
+  return entries.some(
+    (h: any) =>
+      Array.isArray(h.hooks) &&
+      h.hooks.some(
+        (hh: any) => typeof hh.command === 'string' && hh.command.includes(commandFragment),
+      ),
+  );
+}
+
+/**
+ * Merge hook entries into a JSONC settings file, preserving comments and formatting.
+ * Uses chained modify()+applyEdits() calls to append to arrays without a full
+ * JSON.stringify roundtrip that would strip comments.
+ */
+async function mergeHooksJsonc(
+  filePath: string,
+  entries: Array<{ eventName: string; value: unknown }>,
+): Promise<boolean> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(filePath, 'utf-8');
+  } catch {
+    raw = '';
+  }
+
+  if (raw.trim().length === 0) {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    const hooks: any = {};
+    for (const { eventName, value } of entries) {
+      hooks[eventName] = [value];
+    }
+    const formattingOptions = { tabSize: 2, insertSpaces: true };
+    const edits = modify('{}', ['hooks'], hooks, { formattingOptions });
+    await fs.writeFile(filePath, applyEdits('{}', edits), 'utf-8');
+    return true;
+  }
+
+  const parseErrors: ParseError[] = [];
+  const tree = parseTree(raw, parseErrors);
+
+  if (!tree || tree.type !== 'object' || parseErrors.length > 0) {
+    return false;
+  }
+
+  const formattingOptions = detectIndentation(raw);
+  let current = raw;
+
+  for (const { eventName, value } of entries) {
+    // Re-parse after each edit to get a fresh insertion index.
+    const currentTree = parseTree(current, []);
+    const hooksNode = currentTree?.children?.find(
+      (c) => c.type === 'property' && c.children?.[0]?.value === 'hooks',
+    );
+    const eventNode = hooksNode?.children?.[1]?.children?.find(
+      (c: any) => c.type === 'property' && c.children?.[0]?.value === eventName,
+    );
+
+    let insertIndex: number;
+    if (eventNode?.children?.[1] && Array.isArray(eventNode.children[1].children)) {
+      insertIndex = eventNode.children[1].children.length;
+    } else {
+      insertIndex = 0;
+    }
+
+    const edits = modify(current, ['hooks', eventName, insertIndex], value, {
+      formattingOptions,
+    });
+    current = applyEdits(current, edits);
+  }
+
+  await fs.writeFile(filePath, current, 'utf-8');
+  return true;
+}
+
+const HOOK_HELPERS = [
+  'hook-lock.cjs',
+  'hook-db-lock-probe.cjs',
+  'win-rm-list-json.ps1',
+  'resolve-analyze-cmd.cjs',
+] as const;
+
+// win-rm-list-json.ps1 is best-effort: it is read (not require()'d) by
+// hook-db-lock-probe.cjs only on Windows, and that probe fails open when the
+// script is absent. Every other helper is top-level require()'d by the adapters,
+// so its absence crashes the installed hook — those are the ones a failed copy
+// must gate hook registration on (see copyHookHelpers' return value).
+const BEST_EFFORT_HOOK_HELPERS = new Set<string>(['win-rm-list-json.ps1']);
+
+/**
+ * Copy the shared hook helpers from `srcDir` into `destDir`. The adapters
+ * top-level `require()` the `.cjs` helpers, so a missing required helper makes
+ * the installed hook crash with MODULE_NOT_FOUND. A failed copy is recorded as a
+ * setup error, and the names of any failed REQUIRED helpers are returned so the
+ * caller can fail closed (skip hook registration) instead of registering a hook
+ * that crashes at runtime. `win-rm-list-json.ps1` is best-effort — its absence is
+ * recorded but does not gate registration. Both the Claude and Antigravity
+ * install paths copy this same list from hooks/claude/ (the canonical source).
+ */
+export async function copyHookHelpers(
+  srcDir: string,
+  destDir: string,
+  label: string,
+  result: SetupResult,
+): Promise<string[]> {
+  const failedRequired: string[] = [];
+  for (const helper of HOOK_HELPERS) {
+    try {
+      await fs.copyFile(path.join(srcDir, helper), path.join(destDir, helper));
+    } catch {
+      result.errors.push(`${label}: failed to copy ${helper} — hook may crash at runtime`);
+      if (!BEST_EFFORT_HOOK_HELPERS.has(helper)) failedRequired.push(helper);
+    }
+  }
+  return failedRequired;
+}
+
+/**
  * Install GitNexus hooks to ~/.claude/settings.json for Claude Code.
- * Merges hook config without overwriting existing hooks.
+ * Merges hook config without overwriting existing hooks, preserving
+ * comments and formatting in the JSONC file.
  */
 async function installClaudeCodeHooks(result: SetupResult): Promise<void> {
   const claudeDir = path.join(os.homedir(), '.claude');
@@ -202,59 +437,301 @@ async function installClaudeCodeHooks(result: SetupResult): Promise<void> {
     const dest = path.join(destHooksDir, 'gitnexus-hook.cjs');
     try {
       let content = await fs.readFile(src, 'utf-8');
-      // Inject resolved CLI path so the copied hook can find the CLI
-      // even when it's no longer inside the npm package tree
       const resolvedCli = path.join(__dirname, '..', 'cli', 'index.js');
       const normalizedCli = path.resolve(resolvedCli).replace(/\\/g, '/');
       const jsonCli = JSON.stringify(normalizedCli);
-      content = content.replace(
-        "let cliPath = path.resolve(__dirname, '..', '..', 'dist', 'cli', 'index.js');",
-        `let cliPath = ${jsonCli};`,
-      );
+      if (!content.includes(CLI_PATH_SOURCE_LITERAL)) {
+        result.errors.push(
+          'Claude Code hooks: gitnexus-hook.cjs no longer contains the cliPath literal to patch — the installed hook may fail to resolve the CLI. Update CLI_PATH_SOURCE_LITERAL in setup.ts.',
+        );
+      }
+      content = content.replace(CLI_PATH_SOURCE_LITERAL, `let cliPath = ${jsonCli};`);
       await fs.writeFile(dest, content, 'utf-8');
     } catch {
       // Script not found in source — skip
     }
 
-    const hookPath = path.join(destHooksDir, 'gitnexus-hook.cjs').replace(/\\/g, '/');
-    const hookCmd = `node "${hookPath.replace(/"/g, '\\"')}"`;
+    // Fail closed: registering the hook without its adapter would crash on every
+    // tool invocation. Mirrors the Antigravity adapter guard below (this path
+    // previously registered regardless of whether the adapter wrote).
+    try {
+      await fs.access(dest);
+    } catch {
+      result.errors.push(
+        'Claude Code hooks: adapter script was not installed — skipping hook registration',
+      );
+      return;
+    }
 
-    // Merge hook config into ~/.claude/settings.json
-    const existing = (await readJsonFile(settingsPath)) || {};
-    if (!existing.hooks) existing.hooks = {};
+    const failedRequired = await copyHookHelpers(
+      pluginHooksPath,
+      destHooksDir,
+      'Claude Code hooks',
+      result,
+    );
+    if (failedRequired.length > 0) {
+      result.errors.push(
+        `Claude Code hooks: required helper(s) ${failedRequired.join(', ')} failed to copy — skipping hook registration`,
+      );
+      return;
+    }
+
+    const hookPath = path.join(destHooksDir, 'gitnexus-hook.cjs').replace(/\\/g, '/');
+    const hookCmd = formatHookCommand(hookPath);
+
+    // Check which hook events need entries (idempotent: skip if already registered)
+    const parsed = await (async () => {
+      try {
+        const r = await fs.readFile(settingsPath, 'utf-8');
+        return parseJsonc(r);
+      } catch {
+        return null;
+      }
+    })();
+
+    const hookEntries: Array<{ eventName: string; value: unknown }> = [];
 
     // NOTE: SessionStart hooks are broken on Windows (Claude Code bug #23576).
     // Session context is delivered via CLAUDE.md / skills instead.
 
-    // Helper: add a hook entry if one with 'gitnexus-hook' isn't already registered
-    interface HookEntry {
-      hooks?: Array<{ command?: string }>;
+    if (!hasGitnexusHook(parsed?.hooks, 'PreToolUse')) {
+      hookEntries.push({
+        eventName: 'PreToolUse',
+        value: {
+          matcher: 'Grep|Glob|Bash',
+          hooks: [
+            {
+              type: 'command',
+              command: hookCmd,
+              timeout: 10,
+              statusMessage: 'Enriching with GitNexus graph context...',
+            },
+          ],
+        },
+      });
     }
-    function ensureHookEntry(
-      eventName: string,
-      matcher: string,
-      timeout: number,
-      statusMessage: string,
-    ) {
-      if (!existing.hooks[eventName]) existing.hooks[eventName] = [];
-      const hasHook = existing.hooks[eventName].some((h: HookEntry) =>
-        h.hooks?.some((hh) => hh.command?.includes('gitnexus-hook')),
+    if (!hasGitnexusHook(parsed?.hooks, 'PostToolUse')) {
+      hookEntries.push({
+        eventName: 'PostToolUse',
+        value: {
+          matcher: 'Bash',
+          hooks: [
+            {
+              type: 'command',
+              command: hookCmd,
+              timeout: 10,
+              statusMessage: 'Checking GitNexus index freshness...',
+            },
+          ],
+        },
+      });
+    }
+
+    if (hookEntries.length === 0) {
+      result.configured.push('Claude Code hooks (already configured)');
+      return;
+    }
+
+    const ok = await mergeHooksJsonc(settingsPath, hookEntries);
+    if (ok) {
+      result.configured.push('Claude Code hooks (PreToolUse, PostToolUse)');
+    } else {
+      result.errors.push(
+        'Claude Code hooks: settings.json is corrupt — skipping to preserve existing content',
       );
-      if (!hasHook) {
-        existing.hooks[eventName].push({
-          matcher,
-          hooks: [{ type: 'command', command: hookCmd, timeout, statusMessage }],
-        });
-      }
     }
-
-    ensureHookEntry('PreToolUse', 'Grep|Glob|Bash', 10, 'Enriching with GitNexus graph context...');
-    ensureHookEntry('PostToolUse', 'Bash', 10, 'Checking GitNexus index freshness...');
-
-    await writeJsonFile(settingsPath, existing);
-    result.configured.push('Claude Code hooks (PreToolUse, PostToolUse)');
   } catch (err: any) {
     result.errors.push(`Claude Code hooks: ${err.message}`);
+  }
+}
+
+// ─── Antigravity (Google) ──────────────────────────────────────────
+//
+// Antigravity stores its MCP config under ~/.gemini/antigravity/mcp_config.json
+// and inherits Gemini CLI's hooks contract
+// (https://geminicli.com/docs/hooks/reference/), which lives at
+// ~/.gemini/settings.json under the canonical `hooks.<EventName>` array layout.
+//
+// We register a single AfterTool entry matching Gemini's built-in search/shell
+// tools (search_file_content|glob|run_shell_command). BeforeTool is not used:
+// the Gemini contract provides no documented context-injection channel for it,
+// so augmentation runs in AfterTool where `hookSpecificOutput.additionalContext`
+// is appended to the tool result the agent reads. See the antigravity hook
+// adapter for the stdin/stdout contract details.
+
+async function setupAntigravity(result: SetupResult): Promise<void> {
+  const antigravityDir = path.join(os.homedir(), '.gemini', 'antigravity');
+  if (!(await dirExists(antigravityDir))) {
+    result.skipped.push('Antigravity (not installed)');
+    return;
+  }
+
+  const mcpPath = path.join(antigravityDir, 'mcp_config.json');
+  try {
+    const ok = await mergeJsoncFile(mcpPath, ['mcpServers', 'gitnexus'], getMcpEntry());
+    if (ok) {
+      result.configured.push('Antigravity');
+    } else {
+      result.errors.push(
+        'Antigravity: mcp_config.json is corrupt — skipping to preserve existing content',
+      );
+    }
+  } catch (err: any) {
+    result.errors.push(`Antigravity: ${err.message}`);
+  }
+}
+
+/**
+ * Install GitNexus skills to ~/.gemini/antigravity/skills/ (global scope,
+ * per https://codelabs.developers.google.com/getting-started-with-antigravity-skills).
+ * Each skill is laid out as {skillName}/SKILL.md just like the other editors.
+ */
+async function installAntigravitySkills(result: SetupResult): Promise<void> {
+  const antigravityDir = path.join(os.homedir(), '.gemini', 'antigravity');
+  if (!(await dirExists(antigravityDir))) return;
+
+  const skillsDir = path.join(antigravityDir, 'skills');
+  try {
+    const installed = await installSkillsTo(skillsDir);
+    if (installed.length > 0) {
+      result.configured.push(
+        `Antigravity skills (${installed.length} skills → ~/.gemini/antigravity/skills/)`,
+      );
+    }
+  } catch (err: any) {
+    result.errors.push(`Antigravity skills: ${err.message}`);
+  }
+}
+
+/**
+ * Install the Antigravity/Gemini-CLI hook adapter to
+ * ~/.gemini/config/hooks/gitnexus/ and register an AfterTool entry in
+ * ~/.gemini/settings.json under `hooks.AfterTool`.
+ *
+ * Why AfterTool (and not BeforeTool): the Gemini hooks reference
+ * (https://geminicli.com/docs/hooks/reference/) does not provide a context-
+ * injection channel for BeforeTool. AfterTool's
+ * `hookSpecificOutput.additionalContext` is the only documented way to
+ * append text the agent will read.
+ */
+async function installAntigravityHooks(result: SetupResult): Promise<void> {
+  const antigravityDir = path.join(os.homedir(), '.gemini', 'antigravity');
+  if (!(await dirExists(antigravityDir))) return;
+
+  const geminiDir = path.join(os.homedir(), '.gemini');
+  const settingsPath = path.join(geminiDir, 'settings.json');
+  const destHooksDir = path.join(geminiDir, 'config', 'hooks', 'gitnexus');
+
+  // The antigravity adapter shares its lock/probe helpers with the claude
+  // adapter — same DB, same concurrency rules — so we reuse those CJS files
+  // from gitnexus/hooks/claude/ rather than duplicating them.
+  const pluginAntigravityDir = path.join(__dirname, '..', '..', 'hooks', 'antigravity');
+  const pluginClaudeDir = path.join(__dirname, '..', '..', 'hooks', 'claude');
+
+  try {
+    await fs.mkdir(destHooksDir, { recursive: true });
+
+    // Adapter script: rewrite the dist path baked into the file so it resolves
+    // to the installed gitnexus CLI rather than the cwd-relative dev path.
+    const adapterSrc = path.join(pluginAntigravityDir, 'gitnexus-antigravity-hook.cjs');
+    const adapterDest = path.join(destHooksDir, 'gitnexus-antigravity-hook.cjs');
+    try {
+      let content = await fs.readFile(adapterSrc, 'utf-8');
+      const resolvedCli = path.join(__dirname, '..', 'cli', 'index.js');
+      const normalizedCli = path.resolve(resolvedCli).replace(/\\/g, '/');
+      const jsonCli = JSON.stringify(normalizedCli);
+      if (!content.includes(CLI_PATH_SOURCE_LITERAL)) {
+        result.errors.push(
+          'Antigravity hooks: gitnexus-antigravity-hook.cjs no longer contains the cliPath literal to patch — the installed hook may fail to resolve the CLI. Update CLI_PATH_SOURCE_LITERAL in setup.ts.',
+        );
+      }
+      content = content.replace(CLI_PATH_SOURCE_LITERAL, `let cliPath = ${jsonCli};`);
+      await fs.writeFile(adapterDest, content, 'utf-8');
+    } catch {
+      // Adapter not found in source — skip
+    }
+
+    // Bail out if the adapter was not written — registering the hook entry
+    // without the script would crash on every tool invocation (top-level
+    // require() of sibling helpers fails with MODULE_NOT_FOUND).
+    try {
+      await fs.access(adapterDest);
+    } catch {
+      result.errors.push(
+        'Antigravity hooks: adapter script was not installed — skipping hook registration',
+      );
+      return;
+    }
+
+    // Shared helpers (copied from hooks/claude/). win-rm-list-json.ps1 is
+    // required by hook-db-lock-probe.cjs on Windows — without it, the MCP
+    // server ownership probe silently fails open and the hook may contend
+    // with the MCP server on the LadybugDB.
+    const failedRequired = await copyHookHelpers(
+      pluginClaudeDir,
+      destHooksDir,
+      'Antigravity hooks',
+      result,
+    );
+    if (failedRequired.length > 0) {
+      result.errors.push(
+        `Antigravity hooks: required helper(s) ${failedRequired.join(', ')} failed to copy — skipping hook registration`,
+      );
+      return;
+    }
+
+    const hookPath = path.join(destHooksDir, 'gitnexus-antigravity-hook.cjs').replace(/\\/g, '/');
+    const hookCmd = formatHookCommand(hookPath);
+
+    const parsed = await (async () => {
+      try {
+        const r = await fs.readFile(settingsPath, 'utf-8');
+        return parseJsonc(r);
+      } catch {
+        return null;
+      }
+    })();
+
+    const hookEntries: Array<{ eventName: string; value: unknown }> = [];
+
+    if (!hasGitnexusHook(parsed?.hooks, 'AfterTool', 'gitnexus-antigravity-hook')) {
+      // Matcher follows the Gemini CLI built-in tool naming (snake_case).
+      // search_file_content / glob cover content + filename search; run_shell_command
+      // catches rg/grep invocations and the git commit family for stale-index hints.
+      hookEntries.push({
+        eventName: 'AfterTool',
+        value: {
+          matcher: 'search_file_content|glob|run_shell_command',
+          hooks: [
+            {
+              type: 'command',
+              command: hookCmd,
+              name: 'gitnexus',
+              // ms — Gemini CLI uses milliseconds (default 60000); Claude Code
+              // uses seconds. 10000 ms = 10 s.
+              timeout: 10000,
+              description: 'GitNexus graph context + stale-index hints',
+            },
+          ],
+        },
+      });
+    }
+
+    if (hookEntries.length === 0) {
+      result.configured.push('Antigravity hooks (already configured)');
+      return;
+    }
+
+    const ok = await mergeHooksJsonc(settingsPath, hookEntries);
+    if (ok) {
+      result.configured.push('Antigravity hooks (AfterTool)');
+    } else {
+      result.errors.push(
+        'Antigravity hooks: settings.json is corrupt — skipping to preserve existing content',
+      );
+    }
+  } catch (err: any) {
+    result.errors.push(`Antigravity hooks: ${err.message}`);
   }
 }
 
@@ -265,14 +742,16 @@ async function setupOpenCode(result: SetupResult): Promise<void> {
     return;
   }
 
-  const configPath = path.join(opencodeDir, 'config.json');
+  const configPath = path.join(opencodeDir, 'opencode.json');
   try {
-    const existing = await readJsonFile(configPath);
-    const config = existing || {};
-    if (!config.mcp) config.mcp = {};
-    config.mcp.gitnexus = getMcpEntry();
-    await writeJsonFile(configPath, config);
-    result.configured.push('OpenCode');
+    const ok = await mergeJsoncFile(configPath, ['mcp', 'gitnexus'], getOpenCodeMcpEntry());
+    if (ok) {
+      result.configured.push('OpenCode');
+    } else {
+      result.errors.push(
+        'OpenCode: opencode.json is corrupt — skipping to preserve existing content',
+      );
+    }
   } catch (err: any) {
     result.errors.push(`OpenCode: ${err.message}`);
   }
@@ -321,6 +800,7 @@ async function setupCodex(result: SetupResult): Promise<void> {
     const entry = getMcpEntry();
     await execFileAsync('codex', ['mcp', 'add', 'gitnexus', '--', entry.command, ...entry.args], {
       shell: process.platform === 'win32',
+      windowsHide: true,
     });
     result.configured.push('Codex');
     return;
@@ -350,15 +830,33 @@ async function setupCodex(result: SetupResult): Promise<void> {
  */
 async function installSkillsTo(targetDir: string): Promise<string[]> {
   const installed: string[] = [];
-  const skillsRoot = path.join(__dirname, '..', '..', 'skills');
+  // GITNEXUS_TEST_SKILLS_ROOT lets tests stage a fixture skills tree without
+  // depending on __dirname resolution under Vitest.
+  const skillsRoot =
+    process.env.GITNEXUS_TEST_SKILLS_ROOT ?? path.join(__dirname, '..', '..', 'skills');
 
+  // Was glob('*.md') + glob('*/SKILL.md'); replaced with fs.readdir because
+  // glob v13's cwd handling did not match the fixture path on Windows runners
+  // (absolute temp paths containing the 8.3 short-name `RUNNER~1` returned
+  // zero matches). fs.readdir has no such path quirks.
   let flatFiles: string[] = [];
   let dirSkillFiles: string[] = [];
   try {
-    [flatFiles, dirSkillFiles] = await Promise.all([
-      glob('*.md', { cwd: skillsRoot }),
-      glob('*/SKILL.md', { cwd: skillsRoot }),
-    ]);
+    const entries = await fs.readdir(skillsRoot, { withFileTypes: true });
+    flatFiles = entries.filter((e) => e.isFile() && e.name.endsWith('.md')).map((e) => e.name);
+    const subdirSkillFiles = await Promise.all(
+      entries
+        .filter((e) => e.isDirectory())
+        .map(async (e) => {
+          try {
+            await fs.access(path.join(skillsRoot, e.name, 'SKILL.md'));
+            return path.join(e.name, 'SKILL.md');
+          } catch {
+            return null;
+          }
+        }),
+    );
+    dirSkillFiles = subdirSkillFiles.filter((p): p is string => p !== null);
   } catch {
     return [];
   }
@@ -434,18 +932,18 @@ async function installCursorSkills(result: SetupResult): Promise<void> {
 }
 
 /**
- * Install global OpenCode skills to ~/.config/opencode/skill/gitnexus/
+ * Install global OpenCode skills to ~/.config/opencode/skills/gitnexus/
  */
 async function installOpenCodeSkills(result: SetupResult): Promise<void> {
   const opencodeDir = path.join(os.homedir(), '.config', 'opencode');
   if (!(await dirExists(opencodeDir))) return;
 
-  const skillsDir = path.join(opencodeDir, 'skill');
+  const skillsDir = path.join(opencodeDir, 'skills');
   try {
     const installed = await installSkillsTo(skillsDir);
     if (installed.length > 0) {
       result.configured.push(
-        `OpenCode skills (${installed.length} skills → ~/.config/opencode/skill/)`,
+        `OpenCode skills (${installed.length} skills → ~/.config/opencode/skills/)`,
       );
     }
   } catch (err: any) {
@@ -492,12 +990,15 @@ export const setupCommand = async () => {
   // Detect and configure each editor's MCP
   await setupCursor(result);
   await setupClaudeCode(result);
+  await setupAntigravity(result);
   await setupOpenCode(result);
   await setupCodex(result);
 
   // Install global skills for platforms that support them
   await installClaudeCodeSkills(result);
   await installClaudeCodeHooks(result);
+  await installAntigravitySkills(result);
+  await installAntigravityHooks(result);
   await installCursorSkills(result);
   await installOpenCodeSkills(result);
   await installCodexSkills(result);

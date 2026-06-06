@@ -4,7 +4,14 @@
  * Note: Different grammars (typescript vs tsx vs javascript) may have
  * slightly different node types. These queries are designed to be
  * compatible with the standard tree-sitter grammars.
+ *
+ * Heritage (extends/implements/embed/trait) is NOT captured here. The legacy
+ * heritage-capture leg was removed (issue #942); inheritance edges are
+ * produced by the registry-primary scope-resolution path, which synthesizes
+ * `@reference.inherits` captures in each language's `languages/<lang>/captures.ts`.
  */
+
+import { ARRAY_METHOD_NOT_ANY_OF_PREDICATE } from './ts-js-hoc-utils.js';
 
 // TypeScript queries - works with tree-sitter-typescript
 export const TYPESCRIPT_QUERIES = `
@@ -61,6 +68,207 @@ export const TYPESCRIPT_QUERIES = `
       name: (identifier) @name
       value: (function_expression)))) @definition.function
 
+; Object-property arrows / function expressions: \`{ addItem: () => ... }\`.
+; The pair's key field carries the meaningful name. Without these patterns,
+; calls inside the arrow are attributed to the file (issue #1166), and the
+; arrow itself is invisible to context() / impact() despite carrying real
+; behaviour (Zustand actions, TanStack queryFn, React Context providers).
+; String-key variant covers \`"add-item": () => ...\`; computed keys
+; (\`[K]: () => ...\`) intentionally fall through anonymous.
+(pair
+  key: (property_identifier) @name
+  value: (arrow_function)) @definition.function
+
+(pair
+  key: (property_identifier) @name
+  value: (function_expression)) @definition.function
+
+(pair
+  key: (string (string_fragment) @name)
+  value: (arrow_function)) @definition.function
+
+(pair
+  key: (string (string_fragment) @name)
+  value: (function_expression)) @definition.function
+
+; HOC-wrapped variable declarations: \`const X = HOC((args) => { ... })\`.
+; Mirrors the registry-primary patterns in \`languages/typescript/query.ts\`
+; so the legacy Call-Resolution DAG and the registry-primary pipeline
+; produce the same set of \`Function\` nodes — required for the CI parity
+; gate. Covers React.forwardRef / memo / useCallback / useMemo / observer
+; / debounce / user-defined HOC factories. The \`var X = HOC(...)\` form is
+; mirrored too (registry-primary has it) so that codebases mixing \`var\` and
+; \`const\` see identical attribution on both pipelines. See
+; \`tsExtractFunctionName\` for the resolution logic and the \`query.ts\`
+; comment for the full anchor-discipline rationale and the chained-
+; array-method trade-off.
+;
+; NOTE: Excludes member-expression calls to common array methods (map, filter,
+; reduce, etc.) to avoid false positives like \`const x = arr.map(a => ...)\`
+; being classified as a Function when it's actually a Const holding an array.
+; Direct identifier calls and member expressions on non-array-methods (like
+; React.memo) are still matched.
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (identifier)
+      arguments: (arguments
+        (arrow_function))))) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (identifier)
+      arguments: (arguments
+        (function_expression))))) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (identifier)
+        arguments: (arguments
+          (arrow_function)))))) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (identifier)
+        arguments: (arguments
+          (function_expression)))))) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (member_expression
+          property: (property_identifier) @callee)
+        arguments: (arguments
+          (arrow_function)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (member_expression
+          property: (property_identifier) @callee)
+        arguments: (arguments
+          (function_expression)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+; \`var X = HOC(...)\` parity with registry-primary. Legacy code (and any
+; transpiler output that downlevels \`const\` to \`var\`) hits this shape.
+; Same array-method exclusions as const/let patterns above.
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (identifier)
+      arguments: (arguments
+        (arrow_function))))) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (identifier)
+      arguments: (arguments
+        (function_expression))))) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+; HOC-wrapped default exports: \`export default defineEventHandler(async (e) => { ... })\`.
+; The worker rewrites the wrapper-derived @name to a file-derived symbol name
+; so helpers like \`defineEventHandler\` / \`React.memo\` do not collapse
+; unrelated modules onto the same Function name.
+ (export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (arrow_function)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (function_expression)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (arrow_function)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (function_expression)))) @definition.function
+
+; Variable/constant declarations (non-function values).
+; Overlap with @definition.function patterns is handled by parse-worker dedup.
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name)) @definition.const
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name))) @definition.const
+
+; var declarations (mutable, function-scoped)
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name)) @definition.variable
+
 (import_statement
   source: (string) @import.source) @import
 
@@ -74,6 +282,23 @@ export const TYPESCRIPT_QUERIES = `
 (call_expression
   function: (member_expression
     property: (property_identifier) @call.name)) @call
+
+; Generic awaited free call: await fn<T>(args)
+; tree-sitter-typescript parses "await fn<T>(args)" as a call_expression whose
+; "function" field is an await_expression (not a bare identifier), because the
+; grammar resolves the ambiguity between generics and comparisons by consuming
+; "await fn" as an expression before attaching <T> as type_arguments.
+(call_expression
+  function: (await_expression
+    (identifier) @call.name)
+  (type_arguments)) @call
+
+; Generic awaited member call: await obj.fn<T>(args)
+(call_expression
+  function: (await_expression
+    (member_expression
+      property: (property_identifier) @call.name))
+  (type_arguments)) @call
 
 ; Constructor calls: new Foo()
 (new_expression
@@ -91,20 +316,6 @@ export const TYPESCRIPT_QUERIES = `
 (required_parameter
   (accessibility_modifier)
   pattern: (identifier) @name) @definition.property
-
-; Heritage queries - class extends
-(class_declaration
-  name: (type_identifier) @heritage.class
-  (class_heritage
-    (extends_clause
-      value: (identifier) @heritage.extends))) @heritage
-
-; Heritage queries - class implements interface
-(class_declaration
-  name: (type_identifier) @heritage.class
-  (class_heritage
-    (implements_clause
-      (type_identifier) @heritage.implements))) @heritage.impl
 
 ; Write access: obj.field = value
 (assignment_expression
@@ -127,6 +338,12 @@ export const TYPESCRIPT_QUERIES = `
   arguments: (arguments
     [(string (string_fragment) @route.url)
      (template_string) @route.template_url])) @route.fetch
+
+; Custom fetch wrappers: apiFetch('/path'), fetchJSON('/api/data'), httpGet('/users'), etc.
+(call_expression
+  function: (identifier) @_wrapper_fn (#match? @_wrapper_fn "^(api(Fetch|Get|Post|Put|Delete|Patch|Request)|fetch(API|JSON|Data|Endpoint|Resource|Url)|http(Fetch|Get|Post|Put|Delete|Patch|Request))$")
+  arguments: (arguments
+    (string (string_fragment) @route.url))) @route.fetch
 
 ; axios.get/post/put/delete/patch('/path'), $.get/post/ajax({url:'/path'})
 (call_expression
@@ -186,6 +403,188 @@ export const JAVASCRIPT_QUERIES = `
       name: (identifier) @name
       value: (function_expression)))) @definition.function
 
+; Object-property arrows / function expressions: \`{ addItem: () => ... }\`.
+; See TYPESCRIPT_QUERIES for rationale (issue #1166).
+(pair
+  key: (property_identifier) @name
+  value: (arrow_function)) @definition.function
+
+(pair
+  key: (property_identifier) @name
+  value: (function_expression)) @definition.function
+
+(pair
+  key: (string (string_fragment) @name)
+  value: (arrow_function)) @definition.function
+
+(pair
+  key: (string (string_fragment) @name)
+  value: (function_expression)) @definition.function
+
+; HOC-wrapped variable declarations: \`const X = HOC((args) => { ... })\`.
+; See TYPESCRIPT_QUERIES section above for the full rationale (issue #1166
+; follow-up — covers forwardRef / memo / useCallback / useMemo / observer
+; / debounce / user-defined HOC factories). Both \`const\` and \`var\` forms
+; are mirrored so JS code that uses \`var\` (or transpiler output) gets the
+; same attribution as the registry-primary path.
+; Excludes common array methods (map, filter, reduce, etc.) to avoid false positives.
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (identifier)
+      arguments: (arguments
+        (arrow_function))))) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (identifier)
+      arguments: (arguments
+        (function_expression))))) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (identifier)
+        arguments: (arguments
+          (arrow_function)))))) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (identifier)
+        arguments: (arguments
+          (function_expression)))))) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (member_expression
+          property: (property_identifier) @callee)
+        arguments: (arguments
+          (arrow_function)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (member_expression
+          property: (property_identifier) @callee)
+        arguments: (arguments
+          (function_expression)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+; \`var X = HOC(...)\` parity with registry-primary.
+; Same array-method exclusions as const/let patterns.
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (identifier)
+      arguments: (arguments
+        (arrow_function))))) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (identifier)
+      arguments: (arguments
+        (function_expression))))) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function))))
+  (#not-any-of? @callee "map" "filter" "reduce" "forEach" "find" "findIndex" "some" "every" "flatMap" "sort" "splice" "slice" "concat" "fill" "copyWithin" "join" "flat" "at" "entries" "keys" "values" "indexOf" "lastIndexOf" "includes" "pop" "push" "shift" "unshift" "reverse" "reduceRight" "toSorted" "toReversed" "toSpliced" "with")) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression))))
+  (#not-any-of? @callee "map" "filter" "reduce" "forEach" "find" "findIndex" "some" "every" "flatMap" "sort" "splice" "slice" "concat" "fill" "copyWithin" "join" "flat" "at" "entries" "keys" "values" "indexOf" "lastIndexOf" "includes" "pop" "push" "shift" "unshift" "reverse" "reduceRight" "toSorted" "toReversed" "toSpliced" "with")) @definition.function
+
+; HOC-wrapped default exports (JS parity with TS patterns above).
+ (export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (arrow_function)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (function_expression)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (arrow_function)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (function_expression)))) @definition.function
+
+; Variable/constant declarations (non-function values).
+; Overlap with @definition.function patterns is handled by parse-worker dedup.
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name)) @definition.const
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name))) @definition.const
+
+; var declarations (mutable, function-scoped)
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name)) @definition.variable
+
 (import_statement
   source: (string) @import.source) @import
 
@@ -208,13 +607,6 @@ export const JAVASCRIPT_QUERIES = `
 (field_definition
   property: (property_identifier) @name) @definition.property
 
-; Heritage queries - class extends (JavaScript uses different AST than TypeScript)
-; In tree-sitter-javascript, class_heritage directly contains the parent identifier
-(class_declaration
-  name: (identifier) @heritage.class
-  (class_heritage
-    (identifier) @heritage.extends)) @heritage
-
 ; Write access: obj.field = value
 (assignment_expression
   left: (member_expression
@@ -235,6 +627,12 @@ export const JAVASCRIPT_QUERIES = `
   arguments: (arguments
     [(string (string_fragment) @route.url)
      (template_string) @route.template_url])) @route.fetch
+
+; Custom fetch wrappers: apiFetch('/path'), fetchJSON('/api/data'), httpGet('/users'), etc.
+(call_expression
+  function: (identifier) @_wrapper_fn (#match? @_wrapper_fn "^(api(Fetch|Get|Post|Put|Delete|Patch|Request)|fetch(API|JSON|Data|Endpoint|Resource|Url)|http(Fetch|Get|Post|Put|Delete|Patch|Request))$")
+  arguments: (arguments
+    (string (string_fragment) @route.url))) @route.fetch
 
 ; axios.get/post, $.get/post/ajax
 (call_expression
@@ -289,11 +687,11 @@ export const PYTHON_QUERIES = `
     left: (identifier) @name
     type: (type)) @definition.property)
 
-; Heritage queries - Python class inheritance
-(class_definition
-  name: (identifier) @heritage.class
-  superclasses: (argument_list
-    (identifier) @heritage.extends)) @heritage
+; Plain variable assignments without type annotation: x = 5, MAX_SIZE = 100
+; Overlap with @definition.property (typed) is handled by parse-worker dedup.
+(expression_statement
+  (assignment
+    left: (identifier) @name)) @definition.variable
 
 ; Write access: obj.field = value
 (assignment
@@ -354,13 +752,10 @@ export const JAVA_QUERIES = `
 ; Constructor calls: new Foo()
 (object_creation_expression type: (type_identifier) @call.name) @call
 
-; Heritage - extends class
-(class_declaration name: (identifier) @heritage.class
-  (superclass (type_identifier) @heritage.extends)) @heritage
-
-; Heritage - implements interfaces
-(class_declaration name: (identifier) @heritage.class
-  (super_interfaces (type_list (type_identifier) @heritage.implements))) @heritage.impl
+; Local variable declarations inside method bodies
+(local_variable_declaration
+  declarator: (variable_declarator
+    name: (identifier) @name)) @definition.variable
 
 ; Write access: obj.field = value
 (assignment_expression
@@ -385,8 +780,17 @@ export const C_QUERIES = `
 
 ; Structs, Unions, Enums, Typedefs
 (struct_specifier name: (type_identifier) @name) @definition.struct
+(type_definition
+  type: (struct_specifier
+    body: (field_declaration_list))
+  declarator: (type_identifier) @name) @definition.struct
 (union_specifier name: (type_identifier) @name) @definition.union
 (enum_specifier name: (type_identifier) @name) @definition.enum
+(type_definition
+  type: (enum_specifier
+    body: (enumerator_list))
+  declarator: (type_identifier) @name) @definition.enum
+(enumerator name: (identifier) @name) @definition.const
 (type_definition declarator: (type_identifier) @name) @definition.typedef
 
 ; Macros
@@ -399,6 +803,11 @@ export const C_QUERIES = `
 ; Calls
 (call_expression function: (identifier) @call.name) @call
 (call_expression function: (field_expression field: (field_identifier) @call.name)) @call
+
+; Variable declarations: int x = 5; or int x;
+(declaration
+  declarator: (init_declarator
+    declarator: (identifier) @name)) @definition.variable
 `;
 
 // Go queries - works with tree-sitter-go
@@ -406,6 +815,7 @@ export const GO_QUERIES = `
 ; Functions & Methods
 (function_declaration name: (identifier) @name) @definition.function
 (method_declaration name: (field_identifier) @name) @definition.method
+(method_elem name: (field_identifier) @name) @definition.method
 
 ; Types
 (type_declaration (type_spec name: (type_identifier) @name type: (struct_type))) @definition.struct
@@ -420,18 +830,17 @@ export const GO_QUERIES = `
   (field_declaration
     name: (field_identifier) @name) @definition.property)
 
-; Struct embedding (anonymous fields = inheritance)
-(type_declaration
-  (type_spec
-    name: (type_identifier) @heritage.class
-    type: (struct_type
-      (field_declaration_list
-        (field_declaration
-          type: (type_identifier) @heritage.extends))))) @definition.struct
-
 ; Calls
 (call_expression function: (identifier) @call.name) @call
 (call_expression function: (selector_expression field: (field_identifier) @call.name)) @call
+
+; Const/var declarations
+(const_declaration (const_spec (identifier) @name)) @definition.const
+(var_declaration (var_spec (identifier) @name)) @definition.variable
+(var_declaration (var_spec_list (var_spec (identifier) @name))) @definition.variable
+
+; Short variable declaration: x := 5
+(short_var_declaration left: (expression_list (identifier) @name)) @definition.variable
 
 ; Struct literal construction: User{Name: "Alice"}
 (composite_literal type: (type_identifier) @call.name) @call
@@ -459,11 +868,34 @@ export const GO_QUERIES = `
 export const CPP_QUERIES = `
 ; Classes, Structs, Namespaces
 (class_specifier name: (type_identifier) @name) @definition.class
+(class_specifier
+  name: (template_type
+    (type_identifier) @name
+    (template_argument_list) @template-arguments)) @definition.class
+; Out-of-line nested definition: class Outer::Inner { ... } / struct Outer::Inner { ... }.
+; Key the node by the full qualified_identifier text so the def materializes a
+; node that matches the HAS_METHOD owner id (also the full qualified text) and
+; stays distinct from a same-tail type in another scope (#1975, #1978).
+(class_specifier name: (qualified_identifier) @name) @definition.class
+(struct_specifier name: (qualified_identifier) @name) @definition.struct
 (struct_specifier name: (type_identifier) @name) @definition.struct
+(struct_specifier
+  name: (template_type
+    (type_identifier) @name
+    (template_argument_list) @template-arguments)) @definition.struct
 (namespace_definition name: (namespace_identifier) @name) @definition.namespace
 (enum_specifier name: (type_identifier) @name) @definition.enum
 
 ; Typedefs and unions (common in C-style headers and mixed C/C++ code)
+(type_definition
+  type: (struct_specifier
+    body: (field_declaration_list))
+  declarator: (type_identifier) @name) @definition.struct
+(type_definition
+  type: (enum_specifier
+    body: (enumerator_list))
+  declarator: (type_identifier) @name) @definition.enum
+(enumerator name: (identifier) @name) @definition.const
 (type_definition declarator: (type_identifier) @name) @definition.typedef
 (union_specifier name: (type_identifier) @name) @definition.union
 
@@ -473,7 +905,9 @@ export const CPP_QUERIES = `
 
 ; Functions & Methods (direct declarator)
 (function_definition declarator: (function_declarator declarator: (identifier) @name)) @definition.function
+(function_definition declarator: (function_declarator declarator: (operator_name) @name)) @definition.function
 (function_definition declarator: (function_declarator declarator: (qualified_identifier name: (identifier) @name))) @definition.method
+(function_definition declarator: (function_declarator declarator: (qualified_identifier name: (operator_name) @name))) @definition.method
 
 ; Functions/methods returning pointers (pointer_declarator wraps function_declarator)
 (function_definition declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))) @definition.function
@@ -485,14 +919,18 @@ export const CPP_QUERIES = `
 
 ; Functions/methods returning references (reference_declarator wraps function_declarator)
 (function_definition declarator: (reference_declarator (function_declarator declarator: (identifier) @name))) @definition.function
+(function_definition declarator: (reference_declarator (function_declarator declarator: (operator_name) @name))) @definition.function
 (function_definition declarator: (reference_declarator (function_declarator declarator: (qualified_identifier name: (identifier) @name)))) @definition.method
+(function_definition declarator: (reference_declarator (function_declarator declarator: (qualified_identifier name: (operator_name) @name)))) @definition.method
 
 ; Destructors (destructor_name is distinct from identifier in tree-sitter-cpp)
 (function_definition declarator: (function_declarator declarator: (qualified_identifier name: (destructor_name) @name))) @definition.method
 
 ; Function declarations / prototypes (common in headers)
 (declaration declarator: (function_declarator declarator: (identifier) @name)) @definition.function
+(declaration declarator: (function_declarator declarator: (operator_name) @name)) @definition.function
 (declaration declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))) @definition.function
+(declaration declarator: (reference_declarator (function_declarator declarator: (operator_name) @name))) @definition.function
 
 ; Class/struct data member fields (Address address; int count;)
 ; Uses field_identifier to exclude method declarations (which use function_declarator)
@@ -511,13 +949,13 @@ export const CPP_QUERIES = `
 
 ; Inline class method declarations (inside class body, no body: void save();)
 ; tree-sitter-cpp uses field_identifier (not identifier) for names inside class bodies
-(field_declaration declarator: (function_declarator declarator: [(field_identifier) (identifier)] @name)) @definition.method
+(field_declaration declarator: (function_declarator declarator: [(field_identifier) (identifier) (operator_name)] @name)) @definition.method
 
 ; Inline class method declarations returning a pointer (User* lookup();)
 (field_declaration declarator: (pointer_declarator declarator: (function_declarator declarator: [(field_identifier) (identifier)] @name))) @definition.method
 
 ; Inline class method declarations returning a reference (User& lookup();)
-(field_declaration declarator: (reference_declarator (function_declarator declarator: [(field_identifier) (identifier)] @name))) @definition.method
+(field_declaration declarator: (reference_declarator (function_declarator declarator: [(field_identifier) (identifier) (operator_name)] @name))) @definition.method
 
 ; Inline class method definitions (inside class body, with body: void Foo() { ... })
 (field_declaration_list
@@ -541,6 +979,11 @@ export const CPP_QUERIES = `
 
 ; Templates
 (template_declaration (class_specifier name: (type_identifier) @name)) @definition.template
+(template_declaration
+  (class_specifier
+    name: (template_type
+      (type_identifier) @name
+      (template_argument_list) @template-arguments))) @definition.template
 (template_declaration (function_definition declarator: (function_declarator declarator: (identifier) @name))) @definition.template
 
 ; Includes
@@ -551,15 +994,16 @@ export const CPP_QUERIES = `
 (call_expression function: (field_expression field: (field_identifier) @call.name)) @call
 (call_expression function: (qualified_identifier name: (identifier) @call.name)) @call
 (call_expression function: (template_function name: (identifier) @call.name)) @call
+(binary_expression operator: "+" @call.name) @call
+(binary_expression operator: "<<" @call.name) @call
 
 ; Constructor calls: new User()
 (new_expression type: (type_identifier) @call.name) @call
 
-; Heritage
-(class_specifier name: (type_identifier) @heritage.class
-  (base_class_clause (type_identifier) @heritage.extends)) @heritage
-(class_specifier name: (type_identifier) @heritage.class
-  (base_class_clause (access_specifier) (type_identifier) @heritage.extends)) @heritage
+; Variable declarations: int x = 5; or auto x = 5;
+(declaration
+  declarator: (init_declarator
+    declarator: (identifier) @name)) @definition.variable
 
 ; Write access: obj.field = value
 (assignment_expression
@@ -617,11 +1061,11 @@ export const CSHARP_QUERIES = `
 ; Target-typed new (C# 9): User u = new("x", 5)
 (variable_declaration type: (identifier) @call.name (variable_declarator (implicit_object_creation_expression) @call))
 
-; Heritage
-(class_declaration name: (identifier) @heritage.class
-  (base_list (identifier) @heritage.extends)) @heritage
-(class_declaration name: (identifier) @heritage.class
-  (base_list (generic_name (identifier) @heritage.extends))) @heritage
+; Local variable declarations
+(local_declaration_statement
+  (variable_declaration
+    (variable_declarator
+      (identifier) @name))) @definition.variable
 
 ; Write access: obj.field = value
 (assignment_expression
@@ -637,10 +1081,19 @@ export const RUST_QUERIES = `
 (function_item name: (identifier) @name) @definition.function
 (function_signature_item name: (identifier) @name) @definition.function
 (struct_item name: (type_identifier) @name) @definition.struct
+; A union is materialized as a Struct node (same rationale as the
+; scope-resolution @declaration.struct in languages/rust/query.ts: every
+; registry-primary resolution gate includes Struct but excludes Union, so a
+; Union-labeled node would be an unresolvable orphan). #1934 F71.
+(union_item name: (type_identifier) @name) @definition.struct
 (enum_item name: (type_identifier) @name) @definition.enum
 (trait_item name: (type_identifier) @name) @definition.trait
 (impl_item type: (type_identifier) @name !trait) @definition.impl
 (impl_item type: (generic_type type: (type_identifier) @name) !trait) @definition.impl
+; Scoped inherent impl: impl path::Type { ... }. Key the Impl node by the full
+; scoped_type_identifier text so it matches the owner id (also full text) and
+; stays distinct from a same-tail type in another module (#1975).
+(impl_item type: (scoped_type_identifier) @name !trait) @definition.impl
 (mod_item name: (identifier) @name) @definition.module
 
 ; Type aliases, const, static, macros
@@ -665,12 +1118,6 @@ export const RUST_QUERIES = `
 (field_declaration_list
   (field_declaration
     name: (field_identifier) @name) @definition.property)
-
-; Heritage (trait implementation) — all combinations of concrete/generic trait × concrete/generic type
-(impl_item trait: (type_identifier) @heritage.trait type: (type_identifier) @heritage.class) @heritage
-(impl_item trait: (generic_type type: (type_identifier) @heritage.trait) type: (type_identifier) @heritage.class) @heritage
-(impl_item trait: (type_identifier) @heritage.trait type: (generic_type type: (type_identifier) @heritage.class)) @heritage
-(impl_item trait: (generic_type type: (type_identifier) @heritage.trait) type: (generic_type type: (type_identifier) @heritage.class)) @heritage
 
 ; Write access: obj.field = value
 (assignment_expression
@@ -756,24 +1203,10 @@ export const PHP_QUERIES = `
 ; Constructor call: new User()
 (object_creation_expression (name) @call.name) @call
 
-; ── Heritage: extends ────────────────────────────────────────────────────────
-(class_declaration
-  name: (name) @heritage.class
-  (base_clause
-    [(name) (qualified_name)] @heritage.extends)) @heritage
-
-; ── Heritage: implements ─────────────────────────────────────────────────────
-(class_declaration
-  name: (name) @heritage.class
-  (class_interface_clause
-    [(name) (qualified_name)] @heritage.implements)) @heritage.impl
-
-; ── Heritage: use trait (must capture enclosing class name) ──────────────────
-(class_declaration
-  name: (name) @heritage.class
-  body: (declaration_list
-    (use_declaration
-      [(name) (qualified_name)] @heritage.trait))) @heritage
+; Const declarations at class scope
+(const_declaration
+  (const_element
+    (name) @name)) @definition.const
 
 ; PHP HTTP consumers: file_get_contents('/path'), curl_init('/path')
 (function_call_expression
@@ -808,9 +1241,20 @@ export const RUBY_QUERIES = `
 (module
   name: (constant) @name) @definition.module
 
+; Namespaced module: module Baz::Qux (name field is a scope_resolution node).
+; Separate top-level pattern (not a [...] alternation) so neither branch is
+; silently dropped — see #1975. The full scope_resolution text keys the node so
+; it matches the HAS_METHOD owner id derived from the same name field.
+(module
+  name: (scope_resolution) @name) @definition.module
+
 ; ── Classes ──────────────────────────────────────────────────────────────────
 (class
   name: (constant) @name) @definition.class
+
+; Namespaced class: class Foo::Bar (name field is a scope_resolution node).
+(class
+  name: (scope_resolution) @name) @definition.class
 
 ; ── Instance methods ─────────────────────────────────────────────────────────
 (method
@@ -824,6 +1268,10 @@ export const RUBY_QUERIES = `
 (call
   method: (identifier) @call.name) @call
 
+; ── Constant assignment: MAX_SIZE = 100, ITEMS = [...] ───────────────────────
+(assignment
+  left: (constant) @name) @definition.const
+
 ; ── Bare calls without parens (identifiers at statement level are method calls) ─
 ; NOTE: This may over-capture variable reads as calls (e.g. 'result' at
 ; statement level). Ruby's grammar makes bare identifiers ambiguous — they
@@ -833,12 +1281,6 @@ export const RUBY_QUERIES = `
 ; elsewhere may produce a false CALLS edge.
 (body_statement
   (identifier) @call.name @call)
-
-; ── Heritage: class < SuperClass ─────────────────────────────────────────────
-(class
-  name: (constant) @heritage.class
-  superclass: (superclass
-    (constant) @heritage.extends)) @heritage
 
 ; Write access: obj.field = value (Ruby setter — syntactically a method call to field=)
 (assignment
@@ -926,20 +1368,6 @@ export const KOTLIN_QUERIES = `
 (infix_expression
   (simple_identifier) @call.name) @call
 
-; ── Heritage: extends / implements via delegation_specifier ──────────────
-; Interface implementation (bare user_type): class Foo : Bar
-(class_declaration
-  (type_identifier) @heritage.class
-  (delegation_specifier
-    (user_type (type_identifier) @heritage.extends))) @heritage
-
-; Class extension (constructor_invocation): class Foo : Bar()
-(class_declaration
-  (type_identifier) @heritage.class
-  (delegation_specifier
-    (constructor_invocation
-      (user_type (type_identifier) @heritage.extends)))) @heritage
-
 ; Write access: obj.field = value
 (assignment
   (directly_assignable_expression
@@ -996,19 +1424,6 @@ export const SWIFT_QUERIES = `
 
 ; Calls - member/navigation calls (obj.method())
 (call_expression (navigation_expression (navigation_suffix (simple_identifier) @call.name))) @call
-
-; Heritage - class/struct/enum inheritance and protocol conformance
-(class_declaration name: (type_identifier) @heritage.class
-  (inheritance_specifier inherits_from: (user_type (type_identifier) @heritage.extends))) @heritage
-
-; Heritage - protocol inheritance
-(protocol_declaration name: (type_identifier) @heritage.class
-  (inheritance_specifier inherits_from: (user_type (type_identifier) @heritage.extends))) @heritage
-
-; Heritage - extension protocol conformance (e.g. extension Foo: SomeProtocol)
-; Extensions wrap the name in user_type unlike class/struct/enum declarations
-(class_declaration "extension" name: (user_type (type_identifier) @heritage.class)
-  (inheritance_specifier inherits_from: (user_type (type_identifier) @heritage.extends))) @heritage
 
 ; Write access: obj.field = value (tree-sitter-swift 0.7.1 uses named fields)
 (assignment
@@ -1098,6 +1513,12 @@ export const DART_QUERIES = `
   (setter_signature
     name: (identifier) @name)) @definition.property
 
+; ── Top-level variable declarations (const maxSize = 100, final x = 5, var y = 0) ──
+(declaration
+  (initialized_identifier_list
+    (initialized_identifier
+      (identifier) @name))) @definition.variable
+
 ; ── Imports ──────────────────────────────────────────────────────────────────
 (import_or_export
   (library_import
@@ -1133,6 +1554,58 @@ export const DART_QUERIES = `
       (identifier) @call.name))
   (selector (argument_part))) @call
 
+; ── Calls: await direct (await doSomething()) ────────────────────────────────
+(await_expression
+  (identifier) @call.name
+  .
+  (selector (argument_part))) @call
+
+; ── Calls: await method chain (await obj.method()) ───────────────────────────
+; Requires argument_part to distinguish method calls from field access (await obj.field)
+(await_expression
+  (selector
+    (unconditional_assignable_selector
+      (identifier) @call.name))
+  (selector (argument_part))) @call
+
+; ── Calls: named argument (foo(child: buildX())) ─────────────────────────────
+(named_argument
+  (identifier) @call.name
+  .
+  (selector (argument_part))) @call
+
+; ── Calls: inside list literals ([buildA(), buildB()]) ───────────────────────
+(list_literal
+  (identifier) @call.name
+  .
+  (selector (argument_part))) @call
+
+; ── Calls: cascade (obj..add(x)..sort()) ─────────────────────────────────────
+; Note: cascade_selector contains identifier directly (no unconditional_assignable_selector
+; wrapper in Dart grammar), so inferCallForm() classifies these as free calls rather than
+; member calls. Cross-file resolution still benefits from the call being recorded.
+(cascade_section
+  (cascade_selector (identifier) @call.name)
+  (argument_part)) @call
+
+; ── Calls: static final field initializers (static final _svc = MyService()) ──
+(static_final_declaration
+  (identifier) @call.name
+  .
+  (selector (argument_part))) @call
+
+; ── Calls: arrow function body (=> buildWidget()) ────────────────────────────
+(function_body "=>"
+  (identifier) @call.name
+  .
+  (selector (argument_part))) @call
+
+; ── Calls: lambda body (() => doSomething()) ─────────────────────────────────
+(function_expression_body
+  (identifier) @call.name
+  .
+  (selector (argument_part))) @call
+
 ; ── Re-exports (export 'foo.dart') ───────────────────────────────────────────
 (import_or_export
   (library_export
@@ -1153,25 +1626,6 @@ export const DART_QUERIES = `
     (unconditional_assignable_selector
       (identifier) @assignment.property))
   right: (_)) @assignment
-
-; ── Heritage: extends ────────────────────────────────────────────────────────
-(class_definition
-  name: (identifier) @heritage.class
-  superclass: (superclass
-    (type_identifier) @heritage.extends)) @heritage
-
-; ── Heritage: implements ─────────────────────────────────────────────────────
-(class_definition
-  name: (identifier) @heritage.class
-  interfaces: (interfaces
-    (type_identifier) @heritage.implements)) @heritage.impl
-
-; ── Heritage: with (mixins) ──────────────────────────────────────────────────
-(class_definition
-  name: (identifier) @heritage.class
-  superclass: (superclass
-    (mixins
-      (type_identifier) @heritage.trait))) @heritage
 `;
 
 import { SupportedLanguages } from 'gitnexus-shared';

@@ -16,7 +16,9 @@
  */
 
 import { writeSync } from 'node:fs';
-import { LocalBackend } from '../mcp/local/local-backend.js';
+import { LocalBackend, VALID_NODE_LABELS } from '../mcp/local/local-backend.js';
+import { cliErrorKey, cliWarnKey } from './cli-message.js';
+import { formatDetectChangesResult } from './detect-changes-format.js';
 
 let _backend: LocalBackend | null = null;
 
@@ -25,7 +27,7 @@ async function getBackend(): Promise<LocalBackend> {
   _backend = new LocalBackend();
   const ok = await _backend.init();
   if (!ok) {
-    console.error('GitNexus: No indexed repositories found. Run: gitnexus analyze');
+    cliErrorKey('tool.noIndexed');
     process.exit(1);
   }
   return _backend;
@@ -67,7 +69,7 @@ export async function queryCommand(
   },
 ): Promise<void> {
   if (!queryText?.trim()) {
-    console.error('Usage: gitnexus query <search_query>');
+    cliErrorKey('tool.usage.query');
     process.exit(1);
   }
 
@@ -92,8 +94,13 @@ export async function contextCommand(
     content?: boolean;
   },
 ): Promise<void> {
+  // Reject a `--`-prefixed uid swallowed from a following flag (see impactCommand).
+  if (options?.uid?.startsWith('--')) {
+    cliErrorKey('tool.usage.context');
+    process.exit(1);
+  }
   if (!name?.trim() && !options?.uid) {
-    console.error('Usage: gitnexus context <symbol_name> [--uid <uid>] [--file <path>]');
+    cliErrorKey('tool.usage.context');
     process.exit(1);
   }
 
@@ -109,27 +116,58 @@ export async function contextCommand(
 }
 
 export async function impactCommand(
-  target: string,
+  target?: string,
   options?: {
     direction?: string;
     repo?: string;
+    uid?: string;
+    file?: string;
+    kind?: string;
     depth?: string;
     includeTests?: boolean;
+    limit?: string;
+    offset?: string;
+    summaryOnly?: boolean;
   },
 ): Promise<void> {
-  if (!target?.trim()) {
-    console.error('Usage: gitnexus impact <symbol_name> [--direction upstream|downstream]');
+  // A `--`-prefixed uid means Commander swallowed a following flag as the uid
+  // value (e.g. `impact --uid --file x` → uid === '--file'). Reject it rather
+  // than forwarding a garbage uid that would silently resolve to not-found.
+  if (options?.uid?.startsWith('--')) {
+    cliErrorKey('tool.usage.impact');
     process.exit(1);
+  }
+  // Target is an optional positional: a uid alone is enough to resolve (parity
+  // with `context [name]`). Only error when neither a target nor a uid is given.
+  if (!target?.trim() && !options?.uid) {
+    cliErrorKey('tool.usage.impact');
+    process.exit(1);
+  }
+  // Soft-validate --kind: an unknown kind is a no-op hint (the backend scores
+  // it but it matches nothing), so warn and proceed rather than rejecting —
+  // parity with the lenient MCP surface and forward-compatible with new labels.
+  if (options?.kind && !VALID_NODE_LABELS.has(options.kind)) {
+    cliWarnKey('tool.warn.unknownKind', { kind: options.kind });
   }
 
   try {
     const backend = await getBackend();
+    const rawLimit = parseInt(options?.limit ?? '', 10);
+    const rawOffset = parseInt(options?.offset ?? '', 10);
+    const parsedLimit = Number.isFinite(rawLimit) ? rawLimit : undefined;
+    const parsedOffset = Number.isFinite(rawOffset) ? rawOffset : undefined;
     const result = await backend.callTool('impact', {
-      target,
+      target: target || undefined,
+      target_uid: options?.uid,
+      file_path: options?.file,
+      kind: options?.kind,
       direction: options?.direction || 'upstream',
       maxDepth: options?.depth ? parseInt(options.depth, 10) : undefined,
       includeTests: options?.includeTests ?? false,
       repo: options?.repo,
+      limit: parsedLimit,
+      offset: parsedOffset,
+      summaryOnly: options?.summaryOnly ?? undefined,
     });
     output(result);
   } catch (err: unknown) {
@@ -153,7 +191,7 @@ export async function cypherCommand(
   },
 ): Promise<void> {
   if (!query?.trim()) {
-    console.error('Usage: gitnexus cypher <cypher_query>');
+    cliErrorKey('tool.usage.cypher');
     process.exit(1);
   }
 
@@ -163,4 +201,18 @@ export async function cypherCommand(
     repo: options?.repo,
   });
   output(result);
+}
+
+export async function detectChangesCommand(options?: {
+  scope?: string;
+  baseRef?: string;
+  repo?: string;
+}): Promise<void> {
+  const backend = await getBackend();
+  const result = await backend.callTool('detect_changes', {
+    scope: options?.scope || 'unstaged',
+    base_ref: options?.baseRef,
+    repo: options?.repo,
+  });
+  output(formatDetectChangesResult(result));
 }

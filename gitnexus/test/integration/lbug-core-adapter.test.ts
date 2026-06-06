@@ -13,6 +13,36 @@ import fs from 'fs/promises';
 import path from 'path';
 import { withTestLbugDB } from '../helpers/test-indexed-db.js';
 
+/**
+ * LadybugDB 0.16.0 has a known Windows-only regression: `Database.close()`
+ * does not release the underlying file lock until the process exits, so any
+ * `closeLbug()` followed by `initLbug(samePath)` in the same process raises
+ * Win32 Error 33. Production paths are unaffected (single open per process).
+ *
+ * Tracking: kuzudb/kuzu#3872 / #3883 / #4730 (file-lock UX gaps on Windows).
+ */
+const itLbugReopen = process.platform === 'win32' ? it.skip : it;
+
+/**
+ * The FTS extension is optional and defaults to a `load-only` install policy
+ * (PR #1161 — offline-first), so on a machine where it was never pre-installed
+ * it cannot load. The tests below exercise the FTS *primitives* directly and
+ * have nothing to assert without the extension — skip them rather than fail.
+ * Graceful degradation when FTS is unavailable is covered at the analyze /
+ * query layer (see run-analyze.ts and the BM25 fallback tests).
+ */
+const FTS_UNAVAILABLE_NOTE =
+  'FTS extension unavailable (load-only policy; not pre-installed on this machine)';
+
+/**
+ * Dynamically skip an FTS-primitive test when the extension cannot load.
+ * `ctx.skip()` aborts the test, so callers should `await` this first thing.
+ */
+const skipUnlessFtsAvailable = async (ctx: { skip: (note?: string) => void }): Promise<void> => {
+  const { loadFTSExtension } = await import('../../src/core/lbug/lbug-adapter.js');
+  if (!(await loadFTSExtension())) ctx.skip(FTS_UNAVAILABLE_NOTE);
+};
+
 // ─── Core LadybugDB Adapter ─────────────────────────────────────────────
 
 withTestLbugDB(
@@ -37,12 +67,39 @@ withTestLbugDB(
         expect(folderRows).toHaveLength(1);
       });
 
-      it('createFTSIndex: creates FTS index on Function table without error', async () => {
+      it('createFTSIndex: creates FTS index on Function table without error', async (ctx) => {
+        await skipUnlessFtsAvailable(ctx);
         const { createFTSIndex } = await import('../../src/core/lbug/lbug-adapter.js');
 
         await expect(
           createFTSIndex('Function', 'function_fts', ['name', 'content']),
         ).resolves.toBeUndefined();
+      });
+
+      it('loadFTSExtension(conn): loads on an explicit connection and returns true', async (ctx) => {
+        await skipUnlessFtsAvailable(ctx);
+        const lbug = (await import('@ladybugdb/core')).default;
+        const { loadFTSExtension, getDatabase } =
+          await import('../../src/core/lbug/lbug-adapter.js');
+
+        const db = getDatabase();
+        expect(db).not.toBeNull();
+
+        // Fresh Connection on the same Database — simulates the pool adapter's
+        // path where loadFTSExtension is called with an explicit connection
+        // rather than the module-level singleton.
+        const freshConn = new lbug.Connection(db!);
+        try {
+          const loaded = await loadFTSExtension(freshConn);
+          expect(loaded).toBe(true);
+
+          // Idempotent on the same connection — calling again still returns true
+          // (exercises the "already loaded" catch branch in the fallback path).
+          const loadedAgain = await loadFTSExtension(freshConn);
+          expect(loadedAgain).toBe(true);
+        } finally {
+          await freshConn.close().catch(() => {});
+        }
       });
 
       it('getLbugStats: returns correct node and edge counts for seeded data', async () => {
@@ -84,7 +141,8 @@ withTestLbugDB(
       });
 
       describe('error handling', () => {
-        it('createFTSIndex handles already-existing index gracefully', async () => {
+        it('createFTSIndex handles already-existing index gracefully', async (ctx) => {
+          await skipUnlessFtsAvailable(ctx);
           const { createFTSIndex } = await import('../../src/core/lbug/lbug-adapter.js');
 
           // First call creates the index (may already exist from earlier test)
@@ -93,6 +151,21 @@ withTestLbugDB(
           // Second call with same params should NOT throw — createFTSIndex catches "already exists"
           await expect(
             createFTSIndex('Function', 'function_fts_dup', ['name', 'content']),
+          ).resolves.toBeUndefined();
+        });
+
+        it('ensureFTSIndex is idempotent and caches across writable calls (#1224)', async (ctx) => {
+          await skipUnlessFtsAvailable(ctx);
+          const { ensureFTSIndex } = await import('../../src/core/lbug/lbug-adapter.js');
+
+          // First call creates the index. Second call must short-circuit on the
+          // in-process cache — guarantees the read-only guard added in #1224
+          // still respects the success path.
+          await expect(
+            ensureFTSIndex('Function', 'function_fts_ensure', ['name', 'content']),
+          ).resolves.toBeUndefined();
+          await expect(
+            ensureFTSIndex('Function', 'function_fts_ensure', ['name', 'content']),
           ).resolves.toBeUndefined();
         });
 
@@ -122,6 +195,24 @@ withTestLbugDB(
           expect(result).toEqual({ deletedNodes: 0 });
         });
       });
+
+      itLbugReopen(
+        'initLbug loads FTS so reopened HTTP-style sessions can query existing indexes',
+        async (ctx) => {
+          await skipUnlessFtsAvailable(ctx);
+          const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+          const indexName = 'function_fts_init_probe';
+
+          await adapter.createFTSIndex('Function', indexName, ['name', 'content']);
+          await adapter.closeLbug();
+
+          await adapter.initLbug(handle.dbPath);
+
+          await expect(adapter.queryFTS('Function', indexName, 'main', 5)).resolves.toEqual(
+            expect.arrayContaining([expect.objectContaining({ filePath: 'src/index.ts' })]),
+          );
+        },
+      );
     });
   },
   {

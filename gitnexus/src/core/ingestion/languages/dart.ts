@@ -2,7 +2,6 @@
  * Dart Language Provider
  *
  * Dart traits:
- *   - importSemantics: 'wildcard' (Dart imports bring everything public into scope)
  *   - exportChecker: public if no leading underscore
  *   - Dart SDK imports (dart:*) and external packages are skipped
  *   - enclosingFunctionFinder: Dart's tree-sitter grammar places function_body
@@ -14,15 +13,34 @@ import type { SyntaxNode } from '../utils/ast-helpers.js';
 import type { NodeLabel } from 'gitnexus-shared';
 import { FUNCTION_NODE_TYPES } from '../utils/ast-helpers.js';
 import { SupportedLanguages } from 'gitnexus-shared';
+import { createClassExtractor } from '../class-extractors/generic.js';
+import { dartClassConfig } from '../class-extractors/configs/dart.js';
 import { defineLanguage } from '../language-provider.js';
+import type { AstFrameworkPatternConfig } from '../language-provider.js';
 import { typeConfig as dartConfig } from '../type-extractors/dart.js';
 import { dartExportChecker } from '../export-detection.js';
-import { resolveDartImport } from '../import-resolvers/dart.js';
+import { createImportResolver } from '../import-resolvers/resolver-factory.js';
+import { dartImportConfig } from '../import-resolvers/configs/dart.js';
 import { DART_QUERIES } from '../tree-sitter-queries.js';
 import { createFieldExtractor } from '../field-extractors/generic.js';
 import { dartConfig as dartFieldConfig } from '../field-extractors/configs/dart.js';
 import { createMethodExtractor } from '../method-extractors/generic.js';
 import { dartMethodConfig } from '../method-extractors/configs/dart.js';
+import { createVariableExtractor } from '../variable-extractors/generic.js';
+import { dartVariableConfig } from '../variable-extractors/configs/dart.js';
+import { createCallExtractor } from '../call-extractors/generic.js';
+import { dartCallConfig } from '../call-extractors/configs/dart.js';
+import {
+  emitDartScopeCaptures,
+  interpretDartImport,
+  interpretDartTypeBinding,
+  dartBindingScopeFor,
+  dartImportOwningScope,
+  dartReceiverBinding,
+  dartMergeBindings,
+  dartArityCompatibility,
+} from './dart/index.js';
+import { DART_BUILT_INS } from './dart/built-ins.js';
 
 /**
  * Resolve the enclosing function from a `function_body` node by looking at its
@@ -57,41 +75,67 @@ const dartEnclosingFunctionFinder = (
   return funcName ? { funcName, label } : null;
 };
 
-const BUILT_INS: ReadonlySet<string> = new Set([
-  'setState',
-  'mounted',
-  'debugPrint',
-  'runApp',
-  'showDialog',
-  'showModalBottomSheet',
-  'Navigator',
-  'push',
-  'pushNamed',
-  'pushReplacement',
-  'pop',
-  'maybePop',
-  'ScaffoldMessenger',
-  'showSnackBar',
-  'deactivate',
-  'reassemble',
-  'debugDumpApp',
-  'debugDumpRenderTree',
-  'then',
-  'catchError',
-  'whenComplete',
-  'listen',
-]);
-
 export const dartProvider = defineLanguage({
   id: SupportedLanguages.Dart,
   extensions: ['.dart'],
+  entryPointPatterns: [
+    /^main$/,
+    /^build$/,
+    /^createState$/,
+    /^initState$/,
+    /^dispose$/,
+    /^didChangeDependencies$/,
+    /^didUpdateWidget$/,
+    /^runApp$/,
+    /^onEvent$/,
+    /^mapEventToState$/,
+  ],
+  astFrameworkPatterns: [
+    {
+      framework: 'flutter',
+      entryPointMultiplier: 2.5,
+      reason: 'flutter-widget',
+      patterns: [
+        'StatelessWidget',
+        'StatefulWidget',
+        'BuildContext',
+        'Widget build',
+        'ChangeNotifier',
+        'GetxController',
+        'Cubit<',
+        'Bloc<',
+        'ConsumerWidget',
+      ],
+    },
+    {
+      framework: 'riverpod',
+      entryPointMultiplier: 2.8,
+      reason: 'riverpod-pattern',
+      patterns: ['@riverpod', 'ref.watch', 'ref.read', 'AsyncNotifier', 'Notifier'],
+    },
+  ] satisfies AstFrameworkPatternConfig[],
   treeSitterQueries: DART_QUERIES,
   typeConfig: dartConfig,
   exportChecker: dartExportChecker,
-  importResolver: resolveDartImport,
-  importSemantics: 'wildcard',
+  importResolver: createImportResolver(dartImportConfig),
+  callExtractor: createCallExtractor(dartCallConfig),
   fieldExtractor: createFieldExtractor(dartFieldConfig),
   methodExtractor: createMethodExtractor(dartMethodConfig),
+  variableExtractor: createVariableExtractor(dartVariableConfig),
+  classExtractor: createClassExtractor(dartClassConfig),
   enclosingFunctionFinder: dartEnclosingFunctionFinder,
-  builtInNames: BUILT_INS,
+  builtInNames: DART_BUILT_INS,
+
+  // ── Scope-based resolution hooks (RFC #909 Ring 3, issue #939) ──────────────
+  // Parsing-side surface consumed by `ScopeExtractor` once per file. The
+  // emit-side `ScopeResolver` lives in `dart/scope-resolver.ts`; the same
+  // function references flow through both interfaces.
+  emitScopeCaptures: emitDartScopeCaptures,
+  interpretImport: interpretDartImport,
+  interpretTypeBinding: interpretDartTypeBinding,
+  bindingScopeFor: dartBindingScopeFor,
+  importOwningScope: dartImportOwningScope,
+  receiverBinding: dartReceiverBinding,
+  mergeBindings: (_scope, bindings) => dartMergeBindings(bindings),
+  arityCompatibility: dartArityCompatibility,
 });
